@@ -1,0 +1,11 @@
+{
+  "name": "backrooms",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": ["shared", "server", "client"],
+  "scripts": {
+    "dev": "python tools/build.py",
+    "build": "python tools/build.py --build",
+    "typecheck": "npm run typecheck -w client && npm run typecheck -w server"
+  }
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+*.zip
+*.tsbuildinfo
+.env*
+npm-debug.log*
+.DS_Store
+
+# claudechan (clon propio, se instala con tools/install.sh)
+/workflow/
+maintenance.json
+
+# base de datos local de las cuentas
+server/data/

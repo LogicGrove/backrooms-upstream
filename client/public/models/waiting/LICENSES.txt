@@ -1,0 +1,29 @@
+Modelos de la sala de espera (ambos CC-BY-4.0; requieren crédito al autor).
+
+=== computer.glb ===
+Model Information:
+* title:	Old Computer
+* source:	https://sketchfab.com/3d-models/old-computer-a5a0d932d4ce4203a09ff8f72003a508
+* author:	Norah (https://sketchfab.com/NorahvanNimwegen)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Old Computer" (https://sketchfab.com/3d-models/old-computer-a5a0d932d4ce4203a09ff8f72003a508) by Norah (https://sketchfab.com/NorahvanNimwegen) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+
+=== button.glb ===
+Model Information:
+* title:	Industrial Button
+* source:	https://sketchfab.com/3d-models/industrial-button-a7e7c1772d764c3b913cccac66932236
+* author:	Zeppelin (https://sketchfab.com/zeppelingames)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Industrial Button" (https://sketchfab.com/3d-models/industrial-button-a7e7c1772d764c3b913cccac66932236) by Zeppelin (https://sketchfab.com/zeppelingames) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+
+Reducidos con tools/pack_glb.py (texturas a 512 px, sin mapas de normales).

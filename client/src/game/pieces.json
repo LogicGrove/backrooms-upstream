@@ -1,0 +1,68 @@
+{
+  "asian_conical_hat": {
+    "slot": "head",
+    "size": 0.56,
+    "scale": 1,
+    "up": 0.2,
+    "fwd": 0,
+    "side": 0,
+    "rx": 0,
+    "ry": 0,
+    "rz": 0
+  },
+  "bicorn_hat": {
+    "slot": "head",
+    "size": 0.46,
+    "scale": 1,
+    "up": 0.2,
+    "fwd": 0,
+    "side": 0,
+    "rx": 0,
+    "ry": 90,
+    "rz": 0
+  },
+  "ushanka": {
+    "slot": "head",
+    "size": 0.36,
+    "scale": 1,
+    "up": 0.17,
+    "fwd": 0,
+    "side": 0,
+    "rx": 0,
+    "ry": 0,
+    "rz": 0
+  },
+  "witch_hat": {
+    "slot": "head",
+    "size": 0.5,
+    "scale": 1,
+    "up": 0.29,
+    "fwd": 0,
+    "side": 0,
+    "rx": 0,
+    "ry": 0,
+    "rz": 0
+  },
+  "doge_hat": {
+    "slot": "head",
+    "size": 0.3,
+    "scale": 1,
+    "up": 0.16,
+    "fwd": 0,
+    "side": 0,
+    "rx": 0,
+    "ry": 0,
+    "rz": 0
+  },
+  "battery": {
+    "slot": "back",
+    "size": 0.5,
+    "scale": 1,
+    "up": 0,
+    "fwd": -0.3,
+    "side": 0,
+    "rx": 0,
+    "ry": 0,
+    "rz": 0
+  }
+}

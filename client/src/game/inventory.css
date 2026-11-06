@@ -1,0 +1,51 @@
+/* El inventario nuevo: personaje 3D y ranuras · mochila en casillas · detalle. Mismo OSD de camcorder: cajitas de borde fino, la elegida en negativo. */
+.iv { display: grid; grid-template-columns: minmax(300px, 1.2fr) minmax(280px, 1.15fr) minmax(220px, 0.8fr); gap: clamp(20px, 2.6vw, 44px); align-items: start; }
+.iv-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.iv-between { display: flex; justify-content: space-between; }
+
+/* el equipo */
+.iv-eq { display: grid; grid-template-columns: minmax(86px, 118px) minmax(0, 1fr) minmax(86px, 118px); gap: 10px; align-items: stretch; }
+.iv-side { display: flex; flex-direction: column; gap: 10px; justify-content: center; }
+.iv-avatar { display: block; width: 100%; height: clamp(300px, 56vh, 640px); cursor: grab; touch-action: none; }
+.iv-avatar:active { cursor: grabbing; }
+.iv-slot { position: relative; aspect-ratio: 1; border: 1px solid var(--br-dim); display: flex; align-items: center; justify-content: center; padding: 18px 6px 6px; }
+.iv-slot[data-cos] { border-style: dashed; }
+.iv-slot[data-fits] { border-color: var(--br-ink); }
+.iv-slot[data-over] { background: var(--br-ink); }
+.iv-label { position: absolute; top: 3px; left: 6px; color: var(--br-dim); font-size: 0.72em; letter-spacing: 0.04em; }
+.iv-slot[data-fits] .iv-label { color: var(--br-ink); }
+.iv-slot[data-over] .iv-label { color: #000; }
+.iv-empty { color: var(--br-dim); font-size: 0.72em; }
+
+/* la mochila */
+.iv-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; padding: 6px; border: 1px solid var(--br-dim); }
+.iv-grid[data-over] { border-color: var(--br-ink); background: rgba(242, 241, 234, 0.12); }
+.iv-cell { position: relative; aspect-ratio: 1; border: 1px solid #5d5b52; background: rgba(0, 0, 0, 0.35); display: flex; align-items: center; justify-content: center; }
+
+/* un objeto dentro de una casilla */
+.br .iv-item { position: relative; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; padding: 4px; cursor: var(--br-hand, grab); touch-action: none; border: 0; }
+.iv-item img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; user-select: none; filter: drop-shadow(2px 2px 0 rgba(0, 0, 0, 0.8)); }
+.iv-item b { position: absolute; right: 3px; bottom: 1px; font-size: 0.78em; font-weight: 400; text-shadow: 1px 1px 0 #000; }
+.br .iv-item:hover, .br .iv-item:focus-visible, .br .iv-item[data-sel] { background: var(--br-ink); color: #000; outline: none; }
+.br .iv-item:hover b, .br .iv-item[data-sel] b, .br .iv-item:focus-visible b { text-shadow: none; }
+.br .iv-item[data-held] { opacity: 0.45; }
+
+/* el detalle */
+.iv-detail { display: grid; grid-template-columns: clamp(64px, 6vw, 96px) 1fr; gap: 12px; align-items: start; border: 1px solid var(--br-dim); padding: 10px; }
+.iv-detail__icon { aspect-ratio: 1; display: flex; align-items: center; justify-content: center; border: 1px solid #3b3a35; }
+.iv-detail__icon img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.iv-detail__t { font-size: 1.1em; margin: 0 0 4px; }
+.iv-detail__l { color: var(--br-dim); margin: 0 0 2px; }
+
+/* lo que se arrastra */
+.iv-ghost { position: fixed; left: -34px; top: -34px; width: 68px; height: 68px; z-index: 7; pointer-events: none; opacity: 0.92; }
+.iv-ghost img { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(3px 3px 0 rgba(0, 0, 0, 0.8)); }
+
+/* pantallas estrechas: las columnas se apilan */
+@media (max-width: 960px) {
+  .iv { grid-template-columns: minmax(0, 1fr); }
+  .iv-avatar { height: clamp(240px, 44vh, 420px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .iv-avatar { cursor: default; }
+}

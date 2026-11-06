@@ -1,0 +1,74 @@
+Cosmetic models (converted with tools/pack_glb.py, textures <= 256 px; bicorn_hat decimated to ~11k triangles, ushanka material converted to plain PBR).
+
+==== asian_conical_hat.glb ====
+Model Information:
+* title:	Asian conical hat
+* source:	https://sketchfab.com/3d-models/asian-conical-hat-d407409ab62543669aac4a30dcb744b5
+* author:	Samuel Francis Johnson (Oneironauticus) (https://sketchfab.com/oneironauticus)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Asian conical hat" (https://sketchfab.com/3d-models/asian-conical-hat-d407409ab62543669aac4a30dcb744b5) by Samuel Francis Johnson (Oneironauticus) (https://sketchfab.com/oneironauticus) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+==== bicorn_hat.glb ====
+Model Information:
+* title:	Bicorn hat
+* source:	https://sketchfab.com/3d-models/bicorn-hat-596276d408ac40f1817bc7c1d710fa63
+* author:	alban (https://sketchfab.com/alban)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Bicorn hat" (https://sketchfab.com/3d-models/bicorn-hat-596276d408ac40f1817bc7c1d710fa63) by alban (https://sketchfab.com/alban) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+==== doge_hat.glb ====
+Model Information:
+* title:	Doge roblox hat
+* source:	https://sketchfab.com/3d-models/doge-roblox-hat-f279521dfe2e4f0b9b5006eb9092c7c3
+* author:	MatiasH290 (https://sketchfab.com/matias029)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Doge roblox hat" (https://sketchfab.com/3d-models/doge-roblox-hat-f279521dfe2e4f0b9b5006eb9092c7c3) by MatiasH290 (https://sketchfab.com/matias029) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+==== ushanka.glb ====
+Model Information:
+* title:	Ushanka - Trapper Hat
+* source:	https://sketchfab.com/3d-models/ushanka-trapper-hat-1046cd56a67d4b79902e47aa0daf3ccb
+* author:	PeteDeee (https://sketchfab.com/vileguypete)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Ushanka - Trapper Hat" (https://sketchfab.com/3d-models/ushanka-trapper-hat-1046cd56a67d4b79902e47aa0daf3ccb) by PeteDeee (https://sketchfab.com/vileguypete) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+==== witch_hat.glb ====
+Model Information:
+* title:	Witch Hat
+* source:	https://sketchfab.com/3d-models/witch-hat-444a0c2f7ed449be9f127341b4eb2137
+* author:	Eques_inferno (https://sketchfab.com/Eques_inferno)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Witch Hat" (https://sketchfab.com/3d-models/witch-hat-444a0c2f7ed449be9f127341b4eb2137) by Eques_inferno (https://sketchfab.com/Eques_inferno) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+==== battery.glb ====
+Model Information:
+* title:	Battery
+* source:	https://sketchfab.com/3d-models/battery-3b3e75dad915432e971b167a33988605
+* author:	Plutonium.software (https://sketchfab.com/plutonium.software)
+
+Model License:
+* license type:	CC-BY-NC-4.0 (http://creativecommons.org/licenses/by-nc/4.0/)
+* requirements:	Author must be credited. No commercial use.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Battery" (https://sketchfab.com/3d-models/battery-3b3e75dad915432e971b167a33988605) by Plutonium.software (https://sketchfab.com/plutonium.software) licensed under CC-BY-NC-4.0 (http://creativecommons.org/licenses/by-nc/4.0/)
