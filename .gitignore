@@ -5,6 +5,8 @@ dist/
 .env*
 npm-debug.log*
 .DS_Store
+*.exe
+
 
 # claudechan (clon propio, se instala con tools/install.sh)
 /workflow/

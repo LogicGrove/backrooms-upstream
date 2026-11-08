@@ -34,6 +34,7 @@ const _hl = new THREE.Vector3(), _hd = new THREE.Vector3(), _hq = new THREE.Quat
 // como a FLASH_D0 y no ciega contra el suelo o una pared cercana); más lejos, alcance completo
 const FLASH_D0 = 4, FLASH_DECAY = 1.2, _fo = new THREE.Vector3(), _ft = new THREE.Vector3(), _v0 = new THREE.Vector3();
 const REACH_T = 0.85; // lo que dura recoger algo, en segundos
+const DRINK_T = 0.5; // lo que se mantiene la lata para beberla (s)
 const WALK = 1.6, RUN = 3.6, JUMP = Math.sqrt(2 * 9.8 * 0.9), G = 9.8, R = 0.3;
 
 /** Un modelo escalado para que su lado mayor mida `size`, centrado en el origen y girado `ry`. */
@@ -140,6 +141,7 @@ export class Player {
   private duckD = 0.6;
   /** Segundos que lleva pulsado el botón de beber (la lata se bebe al mantener 0,5 s). */
   private drinkT = 0;
+  private drankAt = -1e9;
   /** En la sala de espera no se bebe (el servidor solo da vida en una ronda). */
   drinkOff = false;
   private busy = 0; // segundos de una animación de una vez (recoger, recargar)
@@ -213,6 +215,8 @@ export class Player {
   private swayK = 0;
   /** Dónde llevar cada muñeca este fotograma (null = suelta). */
   private gripT: Record<'Left' | 'Right', { pos: THREE.Vector3; quat: THREE.Quaternion; pole: THREE.Vector3 } | null> = { Left: null, Right: null };
+  /** Qué muñeca agarra qué objeto este fotograma y dónde debía quedar (mundo): para que el objeto vaya con la mano si el brazo no llega. */
+  private gripList: { side: 'Left' | 'Right'; item: THREE.Object3D; at: THREE.Vector3 }[] = [];
   private placeItems(k: number) {
     const put = (it: THREE.Object3D, v: View, pos: THREE.Vector3) => (it.position.copy(pos), it.rotation.set(v.rot[0] * D, v.rot[1] * D, v.rot[2] * D));
     put(this.items.flashlight, grips.flashlight.view, _rest.fromArray(grips.flashlight.view.pos));
@@ -262,12 +266,13 @@ export class Player {
     this.aiming = this.aimK > 0.85 && this.hand === 'camera'; // (rifle y pistola de agua solo acercan el arma al ojo)
     // el rifle apuntado es una mira de verdad: la vista se cierra (zoom 1–2,5 con la rueda), el arma y los brazos no se ven y el HUD pone la retícula
     this.scoped = this.aimK > 0.85 && this.hand === 'gun';
-    this.zoom = this.aiming || this.scoped ? THREE.MathUtils.clamp((this.zoom < 1.5 ? 1.8 : this.zoom) + c.zoom * 0.5, 1.5, this.scoped ? 3 : 4) : 1;
+    // camcorder: empieza en 1× (la vista de siempre) y la rueda sube hasta 4×; el rifle sí arranca cerrado (1,8×, entre 1,5× y 3×)
+    this.zoom = this.aiming || this.scoped ? THREE.MathUtils.clamp((this.zoom < (this.scoped ? 1.5 : 1) ? (this.scoped ? 1.8 : 1) : this.zoom) + c.zoom * 0.5, this.scoped ? 1.5 : 1, this.scoped ? 3 : 4) : 1;
     const k = this.aimK * this.aimK * (3 - 2 * this.aimK);
     this.placeItems(k);
     this.items.camera.visible = this.hand === 'camera' && !this.aiming;
     this.items.gun.visible = this.hand === 'gun' && !this.scoped;
-    const fov = THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(settings.fov / 2)) / THREE.MathUtils.lerp(1, this.zoom * 1.25, k)));
+    const fov = THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(settings.fov / 2)) / THREE.MathUtils.lerp(1, this.zoom * (this.scoped ? 1.25 : 1), k)));
     if (Math.abs(fov - this.camera.fov) > 0.01) (this.camera.fov = fov), this.camera.updateProjectionMatrix();
     this.yaw -= c.look.x;
     this.pitch = THREE.MathUtils.clamp(this.pitch - c.look.y, -1.45, 1.45);
@@ -289,7 +294,7 @@ export class Player {
     const wi = this.hot.indexOf('water');
     const held = !this.drinkOff && this.prop === 'water' && this.water > 0 && ((wi >= 0 && c.slotHeld === wi) || !!c.useHeld || !!c.fireHeld);
     this.drinkT = held ? this.drinkT + dt : 0;
-    if (this.drinkT >= 0.5) (this.drinkT = -1e9), this.drink();
+    if (this.drinkT >= DRINK_T) (this.drinkT = -1e9), this.drink();
     this.wetT = Math.max(0, this.wetT - dt);
     this.stunT = Math.max(0, this.stunT - dt);
     this.spray(dt, c);
@@ -307,8 +312,11 @@ export class Player {
     const f = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)), r = new THREE.Vector3(-f.z, 0, f.x);
     const v = f.multiplyScalar(c.move.y).add(r.multiplyScalar(c.move.x));
     if (v.lengthSq() > 0) v.normalize().multiplyScalar(speed * dt);
-    if (this.noclip || !this.blocked(this.pos.x + v.x, this.pos.z)) this.pos.x += v.x;
-    if (this.noclip || !this.blocked(this.pos.x, this.pos.z + v.z)) this.pos.z += v.z;
+    // el borde de un pozo es un muro mientras se pisa suelo (se desliza por él, como por las paredes): sin ese colisionador, una pasarela de 0,75 m
+    // se pierde con cualquier giro de ratón. Se cae saltando; quien ya está dentro del borde (aterrizó de un salto) no se frena. Los mundos falsos no tienen pitAt.
+    const edge = (x: number, z: number) => this.ground && !this.falling && !!this.world.pitAt?.(x, z) && !this.world.pitAt(this.pos.x, this.pos.z);
+    if (this.noclip || !(this.blocked(this.pos.x + v.x, this.pos.z) || edge(this.pos.x + v.x, this.pos.z))) this.pos.x += v.x;
+    if (this.noclip || !(this.blocked(this.pos.x, this.pos.z + v.z) || edge(this.pos.x, this.pos.z + v.z))) this.pos.z += v.z;
     this.speed = speed;
 
     // saltar y caer: sobre un hueco no hay suelo
@@ -409,17 +417,20 @@ export class Player {
     const q = this.camera.quaternion;
     const grip = (side: 'Left' | 'Right', item: THREE.Object3D, h: Hand) => {
       if (this.rig.animator?.playing) return; // bailando: los brazos son de la animación
+      if (!item.children.length) return; // sin modelo todavía (se carga al sacarlo): la mano no agarra el aire
       const arm = this.bones[side + 'Arm'], fore = this.bones[side + 'ForeArm'], hand = this.bones[side + 'Hand'];
       if (!arm || !fore || !hand) return;
       const pole = arm.getWorldPosition(new THREE.Vector3()).add(V(...h.pole).applyQuaternion(q));
       item.updateWorldMatrix(true, false);
       const want = item.getWorldQuaternion(new THREE.Quaternion()).multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(h.rot[0] * D, h.rot[1] * D, h.rot[2] * D)));
       const at = item.localToWorld(V(...h.pos));
+      this.gripList.push({ side, item, at: at.clone() });
       if (this.rig.animator) this.gripT[side] = { pos: at, quat: want, pole };
       else solveArm({ shoulder: this.rig.bone(side + 'Shoulder'), arm, fore, hand }, at, pole, want);
       poseFingers((n) => this.rig.bone(n), side, h.curl, h.spread);
     };
     this.gripT.Left = this.gripT.Right = null;
+    this.gripList.length = 0;
     const gd = this.gadget !== 'none' ? grips[this.gadget] : undefined;
     const two = this.hand === 'gun' || (this.hand === 'camera' && this.aiming) || (this.hand === 'none' && !!gd?.left);
     const lamp = this.left === 'flashlight' && hk < 0.3;
@@ -454,6 +465,27 @@ export class Player {
     }
     if (hk >= 0.3) for (const it of Object.values(this.items)) it.visible = false;
     this.rig.animator?.ik.run(dt); // (los agarres y el resto del IK, ya con los objetivos de este fotograma)
+    // el objeto va con la mano: si el brazo no llega al agarre (objeto lejos del hombro) o aún se está acomodando, el objeto se acerca a
+    // la muñeca lo que falte, en vez de quedarse en el aire con la mano lejos. Se recalcula cada fotograma desde su sitio (placeItems), sin acumular
+    if (this.gripList.length) {
+      const sum = new Map<THREE.Object3D, { d: THREE.Vector3; n: number }>();
+      for (const g of this.gripList) {
+        const hb = this.bones[g.side + 'Hand'];
+        if (!hb) continue;
+        const e = sum.get(g.item) ?? { d: new THREE.Vector3(), n: 0 };
+        e.d.add(hb.getWorldPosition(new THREE.Vector3()).sub(g.at)), e.n++;
+        sum.set(g.item, e);
+      }
+      const inv = this.camera.quaternion.clone().invert();
+      for (const [it, e] of sum) {
+        e.d.divideScalar(e.n);
+        if (e.d.length() < 0.006) continue;
+        e.d.clampLength(0, 0.3).applyQuaternion(inv);
+        it.position.add(e.d);
+        if (it === this.items.gun && this.hand === 'gun') this.items.flashlight.position.add(e.d); // (la linterna va montada en el rifle)
+        it.updateMatrixWorld(true);
+      }
+    }
     if (rk && this.reachAt) {
       // la mano derecha, de su sitio en reposo hasta el objeto, con los dedos hacia abajo
       const arm = this.bones.RightArm, fore = this.bones.RightForeArm, hand = this.bones.RightHand;
@@ -506,6 +538,11 @@ export class Player {
     body.rotation.set(0, this.yaw + Math.PI, 0);
     this.rig.update(dt);
     for (const s of ['Head', 'Neck', 'LeftArm', 'RightArm']) this.bones[s]?.scale.setScalar(1);
+  }
+
+  /** Espectador: nada de lo que llevaba en las manos (ni el cuerpo caído) va con la cámara de quien se mira. Se llama cada fotograma, después de todo lo que los muestra. */
+  hideHeld() {
+    for (const it of Object.values(this.items)) it.visible = false;
   }
 
   /** Se mete en el nicho `h` (centro y yaw de salida, ver HideState): entra en 0,4 s, la linterna se apaga. */
@@ -717,6 +754,7 @@ export class Player {
   /** Beber una lata de Almond Water: vida y aguante llenos y media cordura. */
   drink() {
     if (this.water <= 0) return;
+    this.drankAt = performance.now();
     this.water--;
     this.stamina = 1;
     this.hp = HP_MAX;
@@ -724,6 +762,11 @@ export class Player {
     this.sanity = Math.min(1, this.sanity + 0.5);
     if (this.water <= 0) this.prop = 'none';
     this.onDrink?.();
+  }
+
+  /** Cuánto lleva la lata en los labios (0–1; 0 si no se bebe). Tras el trago se queda llena un instante, para que la barra del HUD (10 Hz) llegue al final. */
+  get drinking() {
+    return this.drinkT > 0 ? Math.min(1, this.drinkT / DRINK_T) : performance.now() - this.drankAt < 250 ? 1 : 0;
   }
 
   /** Sacar la lata de Almond Water (se bebe manteniendo; ver `drinkT`). */

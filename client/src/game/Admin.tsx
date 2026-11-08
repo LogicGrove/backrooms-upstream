@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { LEVELS, SHOP, type AdminAction, type AdminFx, type AdminInfo, type RoomView } from '@backrooms/shared';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
+import { ACHIEVEMENTS, LEVELS, SHOP, type AdminAction, type AdminFx, type AdminInfo, type RoomView } from '@backrooms/shared';
 import type { BackroomsGame } from './game';
 import type { Sock } from '../net';
 import { netStats } from '../net';
+import { copyText, errClear, errList, errReport, errSubscribe, errTotal, errVersion } from '../errlog';
 import './admin.css';
 
 /*
@@ -55,6 +56,7 @@ export default function AdminConsole({ game, sock, room, me }: Props) {
   const [fx, setFx] = useState({ ao: false, smaa: false, sun: false });
   const [find, setFind] = useState('');
   const [count, setCount] = useState(1);
+  useSyncExternalStore(errSubscribe, errVersion); // los errores de render que van saliendo (errlog.ts): el contador de la cabecera y del botón
   const inRoom = !!sock && !!room;
   const openRef = useRef(open);
   openRef.current = open;
@@ -202,15 +204,24 @@ export default function AdminConsole({ game, sock, room, me }: Props) {
   const val = (k: 'speed' | 'jump' | 'slow', n: number) => (setTog({ ...tog, [k]: n }), g?.adminCheat(k, n));
   const give = (id: (typeof SHOP)[number]['id']) => (inRoom ? send({ a: 'give', t, item: id }) : solo1({ item: id }));
   const mine = t === 'me' || !inRoom;
+  const nErr = errList().length;
+  // los errores de render al portapapeles, con la sala y la GPU, para pegarlos tal cual (sin errores copia igualmente el contexto)
+  const copyErrs = async () => {
+    const where = inRoom ? `room ${room!.code}  ${room!.phase}  round ${room!.round}  ${room!.levelId}  players ${room!.players.length}` : 'solo';
+    const txt = [`${new Date().toISOString()}  ${where}`, g?.adminDiag(), '', errReport()].filter((l) => l !== undefined).join('\n');
+    setMsg((await copyText(txt)) ? `COPIED · ${nErr ? `${nErr} RENDER ERRORS (${errTotal()}×)` : 'NO ERRORS RECORDED'}` : 'COPY FAILED');
+  };
 
   return (
     <div ref={box} className="br-adm" role="dialog" aria-label="Admin console" style={at ? { left: at.x, top: at.y, right: 'auto' } : undefined} onContextMenu={(e) => e.stopPropagation()}>
       <header className="br-adm__h" onPointerDown={drag} title="Drag to move">
-        <span>● ADMIN</span>
+        <span>● ADMIN{nErr > 0 && <b className="br-adm__err"> · {nErr} RENDER ERR</b>}</span>
         <span className="br-adm__dim">{inRoom ? `ROOM ${room!.code}` : 'SOLO'} · DRAG HERE · ` / F9 / ESC CLOSE</span>
       </header>
       <div className="br-adm__row">
         <B on={live} run={() => setLive(!live)}>{live ? 'LIVE: KEEP PLAYING' : 'LIVE OFF: INPUT PAUSED'}</B>
+        <B on={nErr > 0} run={() => void copyErrs()}>{nErr ? `COPY RENDER ERRORS · ${nErr}` : 'COPY RENDER ERRORS'}</B>
+        {nErr > 0 && <B run={() => (errClear(), setMsg('ERRORS CLEARED'))}>CLEAR</B>}
         {at && <B run={() => (setAt(null), localStorage.removeItem(POS))}>RESET POSITION</B>}
       </div>
       <nav className="br-adm__tabs">
@@ -250,6 +261,19 @@ export default function AdminConsole({ game, sock, room, me }: Props) {
               {inRoom && !mine && <B run={() => send({ a: 'ammo', t, on: false })}>AMMO OFF</B>}
             </div>
           </section>
+          {inRoom && (
+            <section>
+              <h3>ACHIEVEMENTS · TARGET NEEDS AN ACCOUNT</h3>
+              <div className="br-adm__row">
+                <B run={() => send({ a: 'award', t, key: '*' })}>AWARD ALL</B>
+              </div>
+              <div className="br-adm__row">
+                {ACHIEVEMENTS.map((x) => (
+                  <B key={x.key} run={() => send({ a: 'award', t, key: x.key })}>{x.name}</B>
+                ))}
+              </div>
+            </section>
+          )}
           <section>
             <h3>CHEATS · THIS CLIENT</h3>
             <div className="br-adm__row">

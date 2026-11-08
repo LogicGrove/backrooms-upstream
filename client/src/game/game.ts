@@ -35,6 +35,7 @@ import { holdStill } from './still';
 import { netStats, type Sock } from '../net';
 import { worldTl } from './interp';
 import { settings } from '../settings';
+import { watchCanvas } from '../errlog';
 import { gearIcons } from './invIcons';
 import { prepAvatar } from './InvAvatar';
 import { AMMO_PACK, canHold, ITEM_IDS, START_INV, type AdminFx, makeMission, missionLine, tvCount, type ActiveMission, type Inventory, type ItemId, type MissionKind, type Maze, type LevelCaps, levelCaps } from '@backrooms/shared';
@@ -141,6 +142,8 @@ export interface Hud {
   /** Mi vida (0–100) y la de los demás de la sala por id (según el servidor). */
   hp: number;
   hps: Record<string, number>;
+  /** Bebiendo una lata de Almond Water: lo que lleva del trago (0–1; 0 si no). */
+  drink: number;
   /** Escondido: el aire (0–1), si una entidad lo inspecciona (hay que mantener Space) y si lo contiene. */
   breath: { air: number; warn: boolean; held: boolean } | null;
   /** Se juega sin el puntero capturado (se reanudó con Esc): un clic lo captura. */
@@ -422,6 +425,7 @@ export class BackroomsGame {
 
   constructor(readonly canvas: HTMLCanvasElement, readonly opts: { low: boolean; reduced: boolean }) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+    watchCanvas(canvas);
     this.renderer.localClippingEnabled = true; // (el agua dentro del depósito de la pistola de agua, poolmap.ts tankFx)
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -844,7 +848,7 @@ export class BackroomsGame {
     if (pl && this.mp?.inv?.tank) inv.tank = true;
     const hidden = !!p && p.hideState !== 'out';
     const ms = this.mission, up = this.ascent;
-    return { mission: ms ? { kind: ms.kind, text: ms.text, line: missionLine(ms), progress: ms.progress, goal: ms.goal, done: ms.done } : null, ascent: up ? { boarded: !!this.mp && up.boarded.includes(this.mp.id), left: Math.max(0, up.left - (performance.now() - up.at) / 1000) } : null, act: hidden || this.run ? null : this.tvs?.hint ?? pl?.act ?? null, totem: this.totemHud(), needClick: this.input.needClick, bag: this.bagOpen, note: this.gadgets?.note ?? null, hint: hidden || this.run || this.tvs?.hint ? null : this.gadgets?.hint ?? this.items?.hint ?? pl?.hint ?? null, hide: this.dying >= 0 || this.winning || this.spectating ? null : hidden ? (p!.hideState === 'hidden' ? 'leave' : null) : this.hideNear() ? 'hide' : null, breath: p?.concealed ? { air: this.breath.air, warn: this.inspected, held: this.holding } : null, inv, aiming: !!p?.aiming, scoped: !!p?.scoped && !this.spectating, zoom: p?.zoom ?? 1, focus: !!this.items?.focus, tapes: this.items?.tapes ?? 0, photos: this.items?.photos ?? 0, ammo: p?.has.gun ? p.ammo : null, spare: p?.spare ?? 0, battery, time: this.t, hp: p?.hp ?? HP_MAX, hps: this.hps, spectating: this.spectating && !this.run ? (this.remotes.get(this.watching)?.name ?? '') : null, watchList: this.spectating && !this.run ? [...this.remotes.values()].map((r) => ({ name: r.name, on: r.id === this.watching && this.specView !== 'free', dead: r.dead })) : undefined, specView: this.spectating && !this.run ? this.specView : undefined };
+    return { mission: ms ? { kind: ms.kind, text: ms.text, line: missionLine(ms), progress: ms.progress, goal: ms.goal, done: ms.done } : null, ascent: up ? { boarded: !!this.mp && up.boarded.includes(this.mp.id), left: Math.max(0, up.left - (performance.now() - up.at) / 1000) } : null, act: hidden || this.run ? null : this.tvs?.hint ?? pl?.act ?? null, totem: this.totemHud(), needClick: this.input.needClick, bag: this.bagOpen, note: this.gadgets?.note ?? null, hint: hidden || this.run || this.tvs?.hint ? null : this.gadgets?.hint ?? this.items?.hint ?? pl?.hint ?? null, hide: this.dying >= 0 || this.winning || this.spectating ? null : hidden ? (p!.hideState === 'hidden' ? 'leave' : null) : this.hideNear() ? 'hide' : null, breath: p?.concealed ? { air: this.breath.air, warn: this.inspected, held: this.holding } : null, drink: p?.dead ? 0 : p?.drinking ?? 0, inv, aiming: !!p?.aiming, scoped: !!p?.scoped && !this.spectating, zoom: p?.zoom ?? 1, focus: !!this.items?.focus, tapes: this.items?.tapes ?? 0, photos: this.items?.photos ?? 0, ammo: p?.has.gun ? p.ammo : null, spare: p?.spare ?? 0, battery, time: this.t, hp: p?.hp ?? HP_MAX, hps: this.hps, spectating: this.spectating && !this.run ? (this.remotes.get(this.watching)?.name ?? '') : null, watchList: this.spectating && !this.run ? [...this.remotes.values()].map((r) => ({ name: r.name, on: r.id === this.watching && this.specView !== 'free', dead: r.dead })) : undefined, specView: this.spectating && !this.run ? this.specView : undefined };
   }
 
   /** Lo abierto que es el sitio: las celdas libres en 7 × 7 alrededor (0–1). */
@@ -1388,13 +1392,14 @@ export class BackroomsGame {
       return;
     }
     if (this.lobbyHid) (items.forEach((it, k) => (it.visible = this.lobbyVis[k] ?? false)), (this.lobbyHid = false));
-    const cam = wr.camera, pos = cam.position.clone(), rot = cam.rotation.clone();
+    const cam = wr.camera;
     me.pos.set(wr.pos.x, cam.position.y - EYE, wr.pos.z);
     me.yaw = wr.yaw;
     me.pitch = wr.pitch;
-    me.update(dt, { ...c, jump: false, crouch: false });
-    cam.position.copy(pos);
-    cam.rotation.copy(rot);
+    // La mirada ya la aplicó la sala (wr.yaw/pitch): al Player no se le da otra vez (la vista se adelantaba un fotograma). Y la cámara que deja el
+    // Player es la buena mientras se conduce: sus manos (IK) y los objetos que cuelgan de la cámara están calculados contra esa pose; restaurar
+    // la de la sala los separaba (hasta ~12 cm al mirar abajo, más el vaivén). La sala la rehace entera cada fotograma, así que no queda nada pegado.
+    me.update(dt, { ...c, jump: false, crouch: false, look: _none });
     cam.updateMatrixWorld();
     if (c.drop) this.dropSelected();
     wr.lit = me.lightOn;
@@ -1698,6 +1703,9 @@ export class BackroomsGame {
     return this.pool instanceof PoolLevel ? this.pool.camera : this.camera;
   }
   private specCam(dt: number, c: Controls) {
+    this.player?.hideHeld(); // los objetos que llevaba (linterna, cámara, radar...) cuelgan de la cámara: sin esto salen en la vista de quien se mira
+    const cam0 = this.cam;
+    if (cam0.fov !== settings.fov) (cam0.fov = settings.fov), cam0.updateProjectionMatrix(); // (morir mirando por la camcorder dejaba el zoom puesto)
     if (this.specView === 'free') return this.freeFrame(dt, c);
     const live = [...this.remotes.values()].filter((r) => !r.dead);
     let t = this.remotes.get(this.watching);
@@ -1723,8 +1731,14 @@ export class BackroomsGame {
       cam.position.copy(this.specPos);
       cam.lookAt(eye.x + fx * 1.5, eye.y - 0.15, eye.z + fz * 1.5);
     }
+    this.haunt(cam.position);
     cam.updateMatrixWorld();
     this.flash.intensity = t.light ? FLASH * 0.85 : 0;
+  }
+
+  /** En las Poolrooms, el cuerpo caído sigue a la cámara del espectador para que el nivel se ilumine y se dibuje donde se mira. */
+  private haunt(at: THREE.Vector3) {
+    if (this.pool instanceof PoolLevel) (this.pool.ghost ??= new THREE.Vector3()).set(at.x, at.y - EYE, at.z);
   }
 
   /** C: entra o sale de la cámara libre (entra desde donde está la cámara ahora). */
@@ -1747,11 +1761,19 @@ export class BackroomsGame {
     const v = (c.run ? 9 : 3.5) * dt;
     this.freePos.addScaledVector(_want.set(0, 0, -1).applyQuaternion(cam.quaternion), c.move.y * v);
     this.freePos.addScaledVector(_want.set(1, 0, 0).applyQuaternion(cam.quaternion), c.move.x * v);
-    if (m) (this.freePos.x = THREE.MathUtils.clamp(this.freePos.x, 0, m.w * CELL)), (this.freePos.z = THREE.MathUtils.clamp(this.freePos.z, 0, m.h * CELL));
-    this.freePos.y = THREE.MathUtils.clamp(this.freePos.y, 0.3, HEIGHT - 0.2);
+    if (this.pool instanceof PoolLevel) {
+      // las Poolrooms: otro tamaño de mapa y alturas por debajo de 0 (agua, túneles) y hasta las salas altas
+      const b = this.pool.freeBox();
+      (this.freePos.x = THREE.MathUtils.clamp(this.freePos.x, 0, b.x)), (this.freePos.z = THREE.MathUtils.clamp(this.freePos.z, 0, b.z));
+      this.freePos.y = THREE.MathUtils.clamp(this.freePos.y, b.y0, b.y1);
+    } else {
+      if (m) (this.freePos.x = THREE.MathUtils.clamp(this.freePos.x, 0, m.w * CELL)), (this.freePos.z = THREE.MathUtils.clamp(this.freePos.z, 0, m.h * CELL));
+      this.freePos.y = THREE.MathUtils.clamp(this.freePos.y, 0.3, HEIGHT - 0.2);
+    }
     cam.position.copy(this.freePos);
     this.specPos.copy(this.freePos);
     for (const r of this.remotes.values()) r.setFirstPerson(false);
+    this.haunt(cam.position);
     cam.updateMatrixWorld();
     this.flash.intensity = 0;
   }
@@ -1777,8 +1799,8 @@ export class BackroomsGame {
     this.black = 0;
     this.corrupt(0);
     this.vhs.uniforms.uBlack.value = 0;
-    this.camera.fov = 70;
-    this.camera.updateProjectionMatrix();
+    for (const cam of [this.camera, this.cam]) (cam.fov = settings.fov), cam.updateProjectionMatrix();
+    this.player?.hideHeld();
     this.watching = [...this.remotes.values()].find((r) => !r.dead)?.id ?? '';
   }
 
@@ -2135,6 +2157,7 @@ fps ${(1 / Math.max(dt, 1e-3)).toFixed(0)}`;
   /** Vuelvo a la partida: en el sitio que dice el servidor, con la vista y los mandos de siempre. */
   private poolRevived(p: PoolLevel, m: { name: string; x: number; y: number; z: number; yaw: number }) {
     p.dead = false;
+    p.ghost = undefined;
     p.o2 = 1;
     this.spectating = false;
     for (const r of this.remotes.values()) r.setFirstPerson(false);
@@ -2245,6 +2268,20 @@ x ${f(s.x)}  y ${f(s.y)}  z ${f(s.z)}  yaw ${f(s.yaw)}  pitch ${f(s.pitch)}`;
       document.body.append(t), t.select(), document.execCommand('copy'), t.remove();
     }
     return txt;
+  }
+
+  /** Dónde y con qué se renderiza, para acompañar a los errores de render (errlog.ts): nivel, semilla, posición, GPU, pasadas y carga de la escena. */
+  adminDiag() {
+    const gl = this.renderer.getContext(), ext = gl.getExtension('WEBGL_debug_renderer_info'), i = this.renderer.info, f = (n: number) => n.toFixed(2);
+    const pl = this.pool instanceof PoolLevel ? this.pool : undefined, p = this.player;
+    const s = pl ? pl.state : p ? { x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: p.yaw } : undefined;
+    return [
+      `level ${this.mp?.level ?? (pl ? 'poolrooms' : 'level0')}  seed ${pl ? pl.seed : this.seed0}${s ? `  pos ${f(s.x)} ${f(s.y)} ${f(s.z)}  yaw ${f(s.yaw)}` : ''}`,
+      `gpu ${gl.getParameter(ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER)}  ${gl.getParameter(gl.VERSION)}${gl.isContextLost() ? '  CONTEXT LOST' : ''}  gl.getError ${gl.getError()}`,
+      `canvas ${this.canvas.width}x${this.canvas.height}  dpr ${devicePixelRatio}  low ${this.opts.low}  resScale ${settings.resScale}  ao ${!!this.fx?.ao.enabled}  smaa ${!!this.fx?.smaa.enabled}`,
+      `programs ${i.programs?.length ?? '-'}  geometries ${i.memory.geometries}  textures ${i.memory.textures}  calls ${i.render.calls}  tris ${i.render.triangles}`,
+      `ua ${navigator.userAgent}`,
+    ].join('\n');
   }
 
   /** Interruptores de rendimiento de las Poolrooms (para ver qué pasada pesa): AO, SMAA y sombra del sol. Devuelve el estado. */

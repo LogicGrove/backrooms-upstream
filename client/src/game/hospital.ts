@@ -229,6 +229,8 @@ export class Hospital {
   readonly group = new THREE.Group();
   readonly openings: Slot[] = [];
   readonly solids: Slot[] = []; // tramos de pared llenos que quedan sin puerta fija ni utillaje: para las puertas que se abren de golpe
+  /** Lo que ocupa cada objeto arrimado a las paredes (cajas del mundo): runlevel.ts los vuelve sólidos, con margen. */
+  readonly colliders: { x0: number; x1: number; z0: number; z1: number; y0: number; y1: number }[] = [];
   readonly zEnd: number;
   /** Un fluorescente que se apaga o revienta: z, para el sonido. */
   onPop?: (z: number) => void;
@@ -373,6 +375,12 @@ export class Hospital {
       if (k?.isMeshStandardMaterial) k.metalness = Math.min(k.metalness, 0.3);
     });
     const kinds = ['locker', 'locker', 'shelf', 'wheelchair', 'drip', 'stretcher', 'stools', 'ext'];
+    // la caja de cada objeto ya colocado (su sitio y giro finales), para que se pueda chocar con él
+    const solid = (o: THREE.Object3D) => {
+      o.updateMatrixWorld(true);
+      const b = new THREE.Box3().setFromObject(o);
+      this.colliders.push({ x0: b.min.x, x1: b.max.x, z0: b.min.z, z1: b.max.z, y0: b.min.y, y1: b.max.y });
+    };
     for (const s of this.solids) {
       if (rnd() < 0.45) continue;
       const k = kinds[(rnd() * kinds.length) | 0], x = s.side * (HW - 0.38), z = s.z + (rnd() - 0.5) * 1.4, yaw = s.side < 0 ? Math.PI / 2 : -Math.PI / 2;
@@ -387,15 +395,18 @@ export class Hospital {
         o = fit(gl['hospital/extinguisher'], 0.55);
         o.position.set(s.side * (HW - 0.12), 0.95, s.z + 1.2);
         this.group.add(o);
+        solid(o);
         const c = fit(gl['hospital/cupboard'], 0.66);
         c.position.set(s.side * (HW - 0.01), 1.3, s.z - 1);
         c.rotation.y = s.side < 0 ? Math.PI / 2 : -Math.PI / 2;
         this.group.add(c);
+        solid(c);
         continue;
       }
       o.position.set(x, 0, z);
       o.rotation.y = yaw + (k === 'stretcher' ? Math.PI / 2 : 0) + (rnd() - 0.5) * 0.25;
       this.group.add(o);
+      solid(o);
     }
   }
 

@@ -1331,8 +1331,15 @@ export class PoolLevel {
 
   /** Lo ha matado el servidor: se queda donde está. */
   dead = false;
+  /** Espectador: dónde están (pies) los ojos que se miran. Con ello la luz, el sol, el parpadeo y el agua se calculan donde se mira y no donde cayó el cuerpo. */
+  ghost?: THREE.Vector3;
+  /** Hasta dónde puede volar la cámara libre del espectador: x, z máximos y alturas mínima y máxima. */
+  freeBox() {
+    return { x: this.map.w * C, z: this.map.h * C, y0: PY.deep, y1: PY.tall - 0.3 };
+  }
   update(dt: number, c: Controls) {
     this.t += dt;
+    if (this.dead && this.ghost) (this.px = this.ghost.x), (this.py = this.ghost.y), (this.pz = this.ghost.z), (this.vy = 0), (this.ride = undefined);
     if (this.dead) c = { ...c, move: new THREE.Vector2(), jump: false, crouch: false, run: false, fire: false, fireHeld: false, grab: false, grabHeld: false }; // muerto (lo decide el servidor): sin mandos
     c = this.extras(dt, c);
     if (this.faint > 0) c = { ...c, move: new THREE.Vector2(), jump: false, crouch: false, run: false }; // desmayado: no controlas el cuerpo

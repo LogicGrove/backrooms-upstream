@@ -14,8 +14,10 @@ import { H, HW, OPEN, Hospital, fit, mulberry, type Slot } from './hospital';
  * el compositor mientras dura.
  *
  *  - Avanza solo (V0 m/s, estamina infinita); A/D esquiva a los lados, ratón mira (también hacia atrás), Space salta y C/Ctrl/Shift agacha.
- *  - Los monstruos van a su ritmo: si el hueco con el primero es mayor que GAP aprietan, si es menor aflojan. Los objetos NO te frenan:
- *    se dejan atravesar (solo un destello) y caen/salen EARLY s antes de lo que tocaría. Solo hay una oportunidad: si te alcanzan, mueres.
+ *  - Los monstruos van a su ritmo: si el hueco con el primero es mayor que GAP aprietan, si es menor aflojan. Todos los objetos son
+ *    sólidos, pero con colisiones generosas (cajas más pequeñas que el modelo, margen al saltar y al agacharse): un golpe te hace
+ *    tropezar (frena un instante y se come ~2 m de hueco) y lo que sale de las aberturas cae/sale EARLY s antes de lo que tocaría;
+ *    lo arrimado a las paredes te aparta con suavidad. Solo hay una oportunidad: si te alcanzan, mueres.
  *  - De las aberturas laterales sale lo que va a por ti, siempre avisado (golpeteo, temblor, luz) un instante antes y siempre igual,
  *    para aprenderlo: camillas y sillas de ruedas que cruzan (saltar), taquillas y estantes que se caen (saltar o apartarse), un fluorescente
  *    que se descuelga (agachar) y puertas que se abren de golpe (apartarse). Lo demás es ambiente: cortinas, sombras, taburetes, luces que revientan.
@@ -23,6 +25,10 @@ import { H, HW, OPEN, Hospital, fit, mulberry, type Slot } from './hospital';
 
 export const RUN_LEN = 320; // m de pista (a ~6 m/s son ~52 s)
 const V0 = 6.2, GAP = 5.5, CATCH = 1, LAT = 4.6, JUMP = Math.sqrt(2 * 9.8 * 1.15), G = 9.8, EYE = 1.62;
+// colisiones generosas: el jugador es más estrecho que su caja y las de los objetos, más pequeñas que el modelo
+const PR = 0.2; // radio del jugador (m)
+const GX = 0.1, GZ = 0.12, GY = 0.15; // lo que se encoge cada caja por cada lado (m): rozar no cuenta
+const BUMP = 0.5; // s de tropiezo (a 0,35× de velocidad) tras chocar
 const FOES = 0.88; // su ritmo respecto al tuyo: un pelín más despacio
 const INTRO = 6; // 3 s de aviso y 3 s de cuenta atrás
 const LIM = HW - 0.45, BACK = 26, TAIL = 10, EARLY = 1.8; // EARLY: lo que sale de las aberturas arranca esto antes (s): más margen para esquivar
@@ -126,6 +132,8 @@ export class RunLevel {
   private stepAcc = 0;
   private done = false;
   private obs: Obstacle[] = [];
+  /** Lo arrimado a las paredes (hospital.ts): cajas fijas; `hit` = ya se ha chocado con él en este intento. */
+  private fixed: { x0: number; x1: number; z0: number; z1: number; y0: number; y1: number; hit: boolean }[] = [];
   private evs: Ev[] = [];
   private pack: Chaser[] = [];
   private hosp: Hospital;
@@ -155,6 +163,7 @@ export class RunLevel {
     const hall = (this.hosp = new Hospital(assets, BACK + RUN_LEN + TAIL, BACK, mulberry(0x7e57), reduced));
     hall.onPop = (z) => Math.abs(z - this.pz) < 14 && this.audio?.clunk(false);
     sc.add(hall.group);
+    this.fixed = hall.colliders.map((c) => ({ ...c, hit: false }));
     // las paredes de los dos extremos, y la meta: una puerta doble de emergencia con una raya de luz en el suelo
     const endM = own(new THREE.MeshStandardMaterial({ color: 0x8a8d86, roughness: 0.7 }));
     for (const [z, ry] of [[hall.zEnd, Math.PI], [-BACK, 0]] as const) {
@@ -221,6 +230,12 @@ export class RunLevel {
     this.restart();
   }
 
+  /** Un choque: destello, golpe sordo y un tropiezo (frena un instante). */
+  private bump(flash: number) {
+    this.hitFlash = Math.max(this.hitFlash, flash);
+    this.stumble = Math.max(this.stumble, BUMP);
+    this.audio?.clunk(false);
+  }
   private near(z: number) {
     return Math.abs(z - this.pz) < 16;
   }
@@ -277,7 +292,7 @@ export class RunLevel {
     }
     // puertas que golpean y luces que revientan entre medias
     let d = 24;
-    for (const s of hall.solids) if (s.z > d && s.z < RUN_LEN - 10 && r() < 0.18) (this.slam(s, false), (d = s.z + 16));
+    for (const s of hall.solids) if (s.z > d && s.z < RUN_LEN - 10 && r() < 0.18) (this.slam(s), (d = s.z + 16));
   }
 
   /** Camilla o silla de ruedas que sale disparada de la abertura y cruza el pasillo hasta la otra pared (saltar). */
@@ -382,8 +397,8 @@ export class RunLevel {
     });
   }
 
-  /** Puerta que se abre de golpe hacia el pasillo (y, si `hard`, se queda abierta y estorba: apartarse). */
-  private slam(s: Slot, hard = true) {
+  /** Puerta que se abre de golpe hacia el pasillo y se queda abierta, estorbando (apartarse). */
+  private slam(s: Slot) {
     const { side, z } = s, pivot = new THREE.Group(), leaf = this.hosp.door(side), TEL = 0.75, ob = this.addObs(z, 0, 2.1, 0.14);
     leaf.position.set(0, 1.05, 0.55);
     pivot.add(leaf);
@@ -408,7 +423,7 @@ export class RunLevel {
           }
         }
         pivot.rotation.y = -side * ang;
-        ob.on = hard && ang > 0.9;
+        ob.on = ang > 0.9;
       },
     });
   }
@@ -451,20 +466,24 @@ export class RunLevel {
     this.evs[this.evs.length - 1].t = 0;
   }
 
-  /** Un taburete que rueda de una abertura a la pared de enfrente (ambiente: no hace daño). */
+  /** Un taburete que rueda de una abertura a la pared de enfrente (pequeño: se salta o se esquiva). */
   private stool(op: Slot) {
-    const { side, z } = op, obj = fit(this.assets.gltf['hospital/stools'], 0.62), x0 = side * (HW + 3), xEnd = -side * (HW - 0.4);
+    const { side, z } = op, obj = fit(this.assets.gltf['hospital/stools'], 0.62), x0 = side * (HW + 3), xEnd = -side * (HW - 0.4), oz = z + (side > 0 ? 0.4 : -0.4), ob = this.addObs(oz, 0, 0.6, 0.3);
     let stopped = false;
     this.add({
       z, lead: 0.9, obj,
-      reset: () => (obj.position.set(x0, 0, z + (side > 0 ? 0.4 : -0.4)), (obj.rotation.set(0, 0, 0)), (stopped = false)),
+      reset: () => (obj.position.set(x0, 0, oz), (obj.rotation.set(0, 0, 0)), (stopped = ob.on = ob.hit = false)),
       tick: (t) => {
         if (t < 0.3) return void this.thump(z, side, 0.4);
-        if (stopped) return;
-        const x = x0 - side * 8 * (t - 0.3);
-        obj.rotation.z = -side * (t - 0.3) * 7;
-        if (side * (x - xEnd) <= 0) (obj.position.x = xEnd), (stopped = true), this.near(z) && this.audio?.step(true, 1.3, -side * 0.6);
-        else obj.position.x = x;
+        if (!stopped) {
+          const x = x0 - side * 8 * (t - 0.3);
+          obj.rotation.z = -side * (t - 0.3) * 7;
+          if (side * (x - xEnd) <= 0) (obj.position.x = xEnd), (stopped = true), this.near(z) && this.audio?.step(true, 1.3, -side * 0.6);
+          else obj.position.x = x;
+        }
+        ob.x0 = obj.position.x - 0.3;
+        ob.x1 = obj.position.x + 0.3;
+        ob.on = true;
       },
     });
   }
@@ -500,6 +519,7 @@ export class RunLevel {
     this.camera.fov = settings.fov;
     this.camera.updateProjectionMatrix();
     for (const o of this.obs) o.hit = o.on = false;
+    for (const f of this.fixed) f.hit = false;
     for (const e of this.evs) {
       e.t = e.lead > 1e8 ? 0 : -1;
       e.reset();
@@ -605,12 +625,21 @@ export class RunLevel {
     } else this.lunge = Math.max(0, this.lunge - dt * 1.5);
     // los primeros 2,5 s ellos esperan: da tiempo a ponerse a correr
     this.lead += Math.min(1, Math.max(0, (this.go - 1.5) / 1)) * V0 * FOES * (1 + 0.3 * THREE.MathUtils.clamp((gap - GAP) / 3, -0.3, 1) + this.lunge * 0.3) * dt;
-    // choques
+    // choques (generosos: cajas encogidas, y por arriba y por abajo basta con rozar para pasar)
     const head = 1.8 - 0.8 * this.duck;
     for (const o of this.obs) {
-      if (!o.on || o.hit || Math.abs(o.z - this.pz) > o.d + 0.3 || this.px + 0.3 < o.x0 || this.px - 0.3 > o.x1 || this.py >= o.y1 || this.py + head <= o.y0) continue;
-      o.hit = true; // se atraviesa: solo un destello, sin frenar
-      this.hitFlash = Math.max(this.hitFlash, 0.6);
+      if (!o.on || o.hit || Math.abs(o.z - this.pz) > o.d * 0.8 + 0.1 || this.px + PR < o.x0 + GX || this.px - PR > o.x1 - GX || this.py >= o.y1 - GY || this.py + head <= o.y0 + GY) continue;
+      o.hit = true;
+      this.bump(0.6);
+    }
+    // lo arrimado a las paredes: te aparta con suavidad (no se atraviesa ni te frena); solo un choque de verdad hace tropezar
+    for (const f of this.fixed) {
+      if (Math.abs(f.z0 - this.pz) > 8 && Math.abs(f.z1 - this.pz) > 8) continue;
+      const x0 = f.x0 + GX, x1 = f.x1 - GX;
+      if (this.pz + PR < f.z0 + GZ || this.pz - PR > f.z1 - GZ || this.px + PR < x0 || this.px - PR > x1 || this.py >= f.y1 - GY || this.py + head <= f.y0 + GY) continue;
+      const side = (f.x0 + f.x1) / 2 > 0 ? 1 : -1, to = side > 0 ? x0 - PR : x1 + PR, depth = Math.abs(to - this.px);
+      this.px += THREE.MathUtils.clamp(to - this.px, -5 * dt, 5 * dt);
+      if (!f.hit && depth > 0.12) (f.hit = true), this.bump(0.35);
     }
     // pasos, y su ruido: más fuerte cuanto más cerca
     this.stepAcc += this.sp * dt;

@@ -324,6 +324,11 @@
 .br-breath[data-warn] .br-breath__bar i { background: var(--br-rec); }
 .br-breath[data-warn] .br-breath__t { animation: br-breath-blink 0.5s steps(2) infinite; }
 @keyframes br-breath-blink { 50% { opacity: 0.25; } }
+/* beber una lata de Almond Water (se mantiene medio segundo): la misma barra de bloque, justo debajo de la mira; el HUD va a 10 Hz, la transición la alisa */
+.br-drink { position: absolute; left: 50%; top: calc(50% + 2.4em); transform: translateX(-50%); z-index: 3; width: min(40vw, 12em); display: flex; flex-direction: column; align-items: center; gap: 4px; pointer-events: none; font-size: clamp(12px, 1.2vw, 16px); }
+.br-drink p { margin: 0; }
+.br-drink .br-breath__bar { height: 10px; }
+.br-drink .br-breath__bar i { transition: width 0.1s linear; }
 @media (prefers-reduced-motion: reduce) { .br-breath[data-warn] .br-breath__t { animation: none; } }
 
 /* ── cuentas: formularios, código de recuperación, logros y el aviso de logro. Mismo OSD: texto sobre la imagen, líneas y negativo ── */

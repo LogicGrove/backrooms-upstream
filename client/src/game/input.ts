@@ -46,6 +46,14 @@ const TOUCH = 0.006; // por píxel de dedo
 const SPIKE = 500; // píxeles de ratón en un solo evento: más que esto no es una mano
 const LOOK_CAP = 0.35; // radianes de giro máximos por fotograma
 const LOOK_DROP = 1; // lo acumulado que sobra por encima de esto se tira
+/** Teclas que el juego se queda mientras se juega (Keyboard Lock): sin ellas, Ctrl+W (agacharse + avanzar) cierra la pestaña, Ctrl+S guarda la página, etc. Escape no va: sigue pausando y sacando de pantalla completa. */
+const LOCKED_KEYS = [
+  'KeyW', 'KeyA', 'KeyS', 'KeyD', 'KeyE', 'KeyQ', 'KeyR', 'KeyF', 'KeyG', 'KeyX', 'KeyY', 'KeyC', 'KeyT', 'KeyN', 'KeyP', 'KeyL', 'KeyH',
+  'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'Space', 'Tab', 'F5',
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Digit1', 'Digit2', 'Digit3', 'Digit4',
+];
+type KeyboardLockApi = { lock?: (codes?: string[]) => Promise<void>; unlock?: () => void };
+const kbd = () => (navigator as Navigator & { keyboard?: KeyboardLockApi }).keyboard;
 
 export class Input {
   private keys = new Set<string>();
@@ -148,9 +156,17 @@ export class Input {
     // lo que se lleva el puntero o la pestaña: pausa
     doc('pointerlockchange', () => {
       this.asked = -1e9;
-      if (this.locked) (this.lockedAt = performance.now()), (this.needClick = this.soft_ = false);
+      if (this.locked) (this.lockedAt = performance.now()), (this.needClick = this.soft_ = false), this.grabKeyboard();
+      else this.freeKeyboard();
       if (this.wasLocked && !this.locked && this.active && !this.suspend) this.pulses.add('pause');
       this.wasLocked = this.locked;
+    });
+    // Ctrl+W (agacharse + avanzar), Ctrl+T, Ctrl+N...: el navegador se los queda aunque se juegue. Keyboard Lock los deja pasar al juego (Chrome/Edge:
+    // los atajos reservados como Ctrl+W solo se capturan en pantalla completa); donde no hay (o no basta), al menos se pide confirmación antes de cerrar la pestaña
+    on('beforeunload', (e) => {
+      if (!this.active) return;
+      e.preventDefault();
+      e.returnValue = '';
     });
     // el navegador no da el puntero (pedido muy pronto tras soltarlo, o sin un clic): sin ratón no se juega
     doc('pointerlockerror', () => ((this.asked = -1e9), this.fail()));
@@ -210,6 +226,23 @@ export class Input {
 
   unlock() {
     if (this.locked) document.exitPointerLock();
+    this.freeKeyboard();
+  }
+
+  /** Se queda las teclas del juego (ver LOCKED_KEYS). Si el navegador no lo admite o lo rechaza, no pasa nada. */
+  private grabKeyboard() {
+    try {
+      kbd()?.lock?.(LOCKED_KEYS)?.catch?.(() => {});
+    } catch {
+      /* sin Keyboard Lock */
+    }
+  }
+  private freeKeyboard() {
+    try {
+      kbd()?.unlock?.();
+    } catch {
+      /* sin Keyboard Lock */
+    }
   }
 
   /** Empieza la partida: atrás del móvil pausa en vez de salir. */

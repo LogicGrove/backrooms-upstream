@@ -1000,6 +1000,14 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
           [{touch ? 'BAG' : 'E'}] {hud.hide === 'hide' ? 'HIDE' : 'LEAVE'}
         </p>
       )}
+      {screen === 'play' && hud && hud.drink > 0 && !hud.bag && hud.spectating == null && (
+        <div className="br-drink" role="status" aria-label={`Drinking ${Math.round(hud.drink * 100)}%`}>
+          <p>ALMOND WATER</p>
+          <div className="br-breath__bar">
+            <i style={{ width: `${Math.round(hud.drink * 100)}%` }} />
+          </div>
+        </div>
+      )}
       {screen === 'play' && hud?.breath && !hud.bag && hud.spectating == null && (
         <div className="br-breath" data-warn={hud.breath.warn || undefined} role="status">
           <p className="br-breath__t">{hud.breath.warn ? 'HOLD [SPACE]' : hud.breath.held ? 'HOLDING BREATH' : 'HIDING'}</p>

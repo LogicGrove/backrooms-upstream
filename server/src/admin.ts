@@ -1,4 +1,4 @@
-import { ITEM_IDS, type AdminAction, type Kind } from '@backrooms/shared';
+import { ACHIEVEMENT_KEYS, ITEM_IDS, type AdminAction, type Kind } from '@backrooms/shared';
 
 /*
  * Validación de la consola de admin. Lo que llega por el socket es basura hasta que pasa por aquí: solo salen acciones de la lista,
@@ -30,6 +30,10 @@ export function parseAdmin(x: unknown): AdminAction | null {
       return (o.mode === 'add' || o.mode === 'set') && Number.isInteger(o.n) && Math.abs(o.n as number) <= MONEY_MAX ? { a: 'money', mode: o.mode, n: o.n as number } : null;
     case 'give':
       return typeof o.item === 'string' && (ITEM_IDS as string[]).includes(o.item) ? { a: 'give', t, item: o.item as (typeof ITEM_IDS)[number] } : null;
+    case 'award': {
+      const key = id(o.key);
+      return key && (key === '*' || ACHIEVEMENT_KEYS.has(key)) ? { a: 'award', t, key } : null; // '*': todos
+    }
     case 'end':
       return typeof o.ok === 'boolean' ? { a: 'end', ok: o.ok } : null;
     case 'ent': {

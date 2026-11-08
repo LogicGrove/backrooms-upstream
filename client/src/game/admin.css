@@ -7,6 +7,7 @@
 .br-adm__b { font: inherit; letter-spacing: inherit; text-transform: inherit; color: var(--br-ink); text-shadow: inherit; background: transparent; border: 1px solid var(--br-dim); padding: 2px 7px; }
 .br-adm__b:hover { background: var(--br-ink); color: #000; text-shadow: none; }
 .br-adm__b[data-on] { background: var(--br-ink); color: #000; text-shadow: none; }
+.br-adm__err { font-weight: inherit; color: var(--br-ink); }
 .br-adm__msg { margin: 0; color: var(--br-dim); }
 .br-adm__info { margin: 0; white-space: pre-wrap; font: inherit; color: var(--br-ink); }
 

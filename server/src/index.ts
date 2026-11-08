@@ -8,7 +8,7 @@ import {
   type AdminAction, type AdminInfo, type AdminReply, type ClientToServer, type ServerToClient, type Status, type PlayerState, type Room, type RoomView, type RoomInfo, type Look, type Strip,
 } from '@backrooms/shared';
 import { Match, type Player } from './match';
-import { levelCaps, solidAt, startOffset } from '@backrooms/shared';
+import { ACHIEVEMENT_KEYS, levelCaps, solidAt, startOffset } from '@backrooms/shared';
 import { allowedOrigins, handleApi, isAdminName, originOk, userFromCookie } from './auth';
 import { MONEY_LIMIT, parseAdmin } from './admin';
 import { achievementsOf, avatarRef, loadoutOf } from './db';
@@ -533,6 +533,14 @@ io.on('connection', (sock) => {
           }
         }
         return reply({ ok: true });
+      case 'award': {
+        // un logro a quien tenga cuenta (los invitados no guardan nada); `award` lo guarda y avisa al jugador (`achievement`) si era nuevo
+        const accounts = targets.filter((p) => p.uid);
+        if (!accounts.length) return reply({ ok: false, error: 'NO ACCOUNT' });
+        const keys = a.key === '*' ? [...ACHIEVEMENT_KEYS] : [a.key];
+        const given = accounts.reduce((n, p) => n + keys.filter((k) => award(p.uid, k)).length, 0);
+        return reply(given ? { ok: true } : { ok: false, error: 'ALREADY UNLOCKED' });
+      }
       case 'god':
         if (!need(playing)) return;
         for (const p of targets) p.immuneUntil = a.on ? Number.MAX_SAFE_INTEGER : 0;

@@ -468,6 +468,15 @@ export class World {
     for (const v of this.maze.voids) d = Math.min(d, Math.hypot((v.x + 0.5) * CELL - x, (v.y + 0.5) * CELL - z));
     return THREE.MathUtils.clamp(1 - (d - CELL / 2) / 5, 0, 1);
   }
+  /** Hueco de una sala de pozos en ese punto: justo lo que se ve sin suelo (PIT_EDGE incluido). A pie no se entra (ver Player.update): solo se cae saltando. */
+  pitAt(x: number, z: number) {
+    const w = this.maze.w, E = PIT_EDGE;
+    for (const dx of [-E, 0, E]) for (const dz of [-E, 0, E]) {
+      const c = this.cellAt(x + dx, z + dz), i = c.y * w + c.x;
+      if (this.voidSet.has(i) && this.maze.zone[i] === ZONE.pits) return true;
+    }
+    return false;
+  }
   /** Hueco al vacío en ese punto. */
   voidAt(x: number, z: number) {
     const w = this.maze.w, E = PIT_EDGE;

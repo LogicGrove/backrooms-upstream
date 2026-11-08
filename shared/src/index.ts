@@ -201,6 +201,7 @@ export type AdminAction =
   | { a: 'tp'; t: string; to: 'start' | 'elevator' | 'player'; who?: string }
   | { a: 'money'; mode: 'add' | 'set'; n: number }
   | { a: 'give'; t: string; item: ItemId }
+  | { a: 'award'; t: string; key: string } // key: la de un logro, o '*' para todos
   | { a: 'mission' }
   | { a: 'end'; ok: boolean }
   | { a: 'tvs' }
