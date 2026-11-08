@@ -1,24 +1,32 @@
 'use client';
+import { DEV_LOCAL } from '../devGate';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import gsap from 'gsap';
 import { holdStill } from './still';
-import { BackroomsGame, type Hud } from './game';
+import { BackroomsGame, type Hud, type Inv } from './game';
 import { generateMaze } from './maze';
 import Touch from './Touch';
-import Inventory from './Inventory';
+import Inventory, { type Cell } from './Inventory';
+import Hotbar from './Hotbar';
+import TotemUi from './Totem';
+import { HOT } from './quickslots';
 import { setCursors } from './cursors';
-import { DIFFICULTY } from '@backrooms/shared';
+import { AMMO_PACK, DIFFICULTY, type Inventory as SrvInv, type ItemId, type RoomView, type RoundResult } from '@backrooms/shared';
 import { useNet, useServer } from '../net';
-import { useAccount } from '../account';
-import { AuthScreen, AccountBox, AccountMenu, AchievementsScreen, Toasts, type AuthMode } from './Account';
+import { avatarUrl, useAccount } from '../account';
+import { Avatar, AuthScreen, AccountBox, AccountMenu, AchievementsScreen, Toasts, type AuthMode } from './Account';
 import Frame from './Frame';
 import SettingsPane from './Settings';
 import { Crosshair } from './Crosshair';
 import { onSetting, settings, useSettings } from '../settings';
 import Lobby, { ServerNotice } from './Lobby';
 import Computer, { guestLook } from './Computer';
+import Board, { BoardHint } from './Board';
 import { DIFF } from './RoomSettings';
 import End from './End';
+import Loading from './Loading';
+import AdminConsole from './Admin';
+import WaitPanel from './WaitPanel';
 import { ChatInput, ChatLog, useChat } from './Chat';
 
 /*
@@ -29,7 +37,7 @@ import { ChatInput, ChatLog, useChat } from './Chat';
 
 type Screen = 'load' | 'menu' | 'settings' | 'achv' | 'play' | 'pause' | 'dead' | 'crash' | 'lobby' | 'wait' | 'waitpause' | 'over';
 type WaitHud = BackroomsGame['waitHud'];
-const NO_WAIT: WaitHud = { ready: false, hint: null, label: '', notice: '', computer: false, entering: false, locked: false, free: true };
+const NO_WAIT: WaitHud = { ready: false, hint: null, label: '', notice: '', computer: false, board: false, entering: false, locked: false, free: true };
 const BLOCKS = 24;
 
 // desarrollo: el laberinto de una semilla en ASCII (S inicio, L ascensor, C cámara, P pistola, t cintas, E entidades, O huecos)
@@ -152,7 +160,8 @@ function Osd({ hud }: { hud: Hud }) {
       <p className="br-osd__br">
         x{hud.zoom.toFixed(1)}
         <br />
-        PHOTOS {hud.photos}/2
+        PHOTOS {hud.photos}
+        {hud.mission?.kind === 'photos' ? `/${hud.mission.goal}` : ''}
       </p>
       <div className="br-osd__focus" data-on={hud.focus || undefined} aria-hidden="true">
         <i />
@@ -164,10 +173,17 @@ function Osd({ hud }: { hud: Hud }) {
   );
 }
 
-/** La misión, siempre en pantalla (sin mirar por la cámara): qué toca ahora, las cintas y las fotos en bloques y, si se gasta, el aguante. */
-function Mission({ hud }: { hud: Hud }) {
-  const i = hud.inv;
-  const goal = !i.camera ? 'FIND A CAMCORDER' : i.tapes < 8 ? 'FIND THE TAPES' : i.photos < 2 ? 'PHOTOGRAPH 2 ENTITIES' : 'REACH THE ELEVATOR';
+/** La misión de la ronda, siempre en pantalla (sin mirar por la cámara): el objetivo, su progreso en bloques («PHOTOS 1/3», «TVS 2/4») y, si se gasta, la linterna y el aguante. */
+/** El inventario del servidor como lo espera el menú de la mochila (en la sala de espera no hay jugador: manos y cinturón quedan vacíos). */
+function waitInv(s: SrvInv, hot: (string | null)[] = ['caution', null, null, null], left: 'none' | 'flashlight' = 'flashlight'): Inv {
+  return { hand: 'none', left, belt: 'none', stamina: 1, sanity: 1, escaped: false, camera: s.camera, gun: s.gun, ammo: Math.min(s.ammo, AMMO_PACK), spare: Math.max(0, s.ammo - AMMO_PACK), tapes: 0, photos: 0, thumbs: [], full: [], flashOn: false, battery: 1, charge: 1, spares: s.spares, water: s.water, totem: s.totem, radar: s.radar, caution: s.caution, tank: s.tank, tankOn: true, watergun: s.watergun, tape: 1, hot, hotSel: 0, gadget: 'none' };
+}
+
+/** La misión de la ronda, siempre en pantalla (sin mirar por la cámara): el objetivo, su progreso en bloques («PHOTOS 1/3», «TVS 2/4») y, si se gasta, la linterna y el aguante. */
+function Mission({ hud, room }: { hud: Hud; room: RoomView | null }) {
+  const i = hud.inv, m = hud.mission, up = hud.ascent;
+  const aboard = (room?.ascent?.boarded ?? []).map((id) => room?.players.find((p) => p.id === id)?.name || 'ANON');
+  const goal = !m ? '' : m.done ? 'ELEVATOR OPEN' : m.kind === 'photos' && !i.camera ? 'FIND A CAMCORDER' : m.text;
   const blocks = (n: number, of: number) => (
     <>
       {'▮'.repeat(n)}
@@ -176,18 +192,81 @@ function Mission({ hud }: { hud: Hud }) {
   );
   return (
     <div className="br-mission" aria-live="polite">
-      <p>{goal}</p>
-      <p aria-label={`tapes ${i.tapes} of 8`}>TAPES {blocks(i.tapes, 8)} {i.tapes}/8</p>
-      {i.camera && <p aria-label={`photos ${i.photos} of 2`}>PHOTOS {blocks(i.photos, 2)} {i.photos}/2</p>}
+      {m && (
+        <p className={m.done ? 'br-lift__t' : undefined} data-urgent={(m.done && !!up && !up.boarded) || undefined}>
+          {goal}
+        </p>
+      )}
+      {m?.done && (
+        <div className="br-lift">
+          <p>{up ? `${up.boarded ? 'YOU ARE ABOARD. WAITING FOR THE OTHERS. ' : 'CLOSES IN '}${Math.ceil(up.left)}S` : 'GET EVERYONE IN BEFORE IT CLOSES'}</p>
+          {aboard.length > 0 && <p className="br-osd__dim">ABOARD {aboard.join(', ')}</p>}
+        </div>
+      )}
+      {m && !m.done && (
+        <p aria-label={m.line}>
+          {m.line} {m.kind === 'survive' ? blocks(Math.round((m.progress / m.goal) * 10), 10) : blocks(m.progress, m.goal)}
+        </p>
+      )}
       {(i.charge < 0.99 || i.spares > 0) && (
         <p className="br-mission__stamina" data-low={i.charge < 0.2 || undefined}>
           {i.charge <= 0 ? (i.spares ? 'LIGHT DEAD [F] NEW FLASHLIGHT' : 'LIGHT DEAD') : <>LIGHT {blocks(Math.round(i.charge * 10), 10)}</>}
           {i.spares > 0 && i.charge > 0 ? ` +${i.spares}` : ''}
         </p>
       )}
+      {i.hand === 'gun' && (
+        <p className="br-mission__stamina" data-low={i.ammo + i.spare === 0 || undefined} aria-label={`Rifle: ${i.ammo} in the magazine, ${i.spare} in reserve`}>
+          AMMO {blocks(i.ammo, AMMO_PACK)} {i.ammo}/{i.spare}
+        </p>
+      )}
       {i.stamina < 0.99 && <p className="br-mission__stamina" data-low={i.stamina < 0.25 || undefined}>STAMINA {blocks(Math.round(i.stamina * 10), 10)}</p>}
     </div>
   );
+}
+
+/** Un jugador del equipo: su foto, nombre, si cayó y (en partida) su vida 0–100. */
+interface Mate {
+  id: string;
+  name: string;
+  avatar: string;
+  dead: boolean;
+  hp?: number;
+}
+
+/** El equipo, arriba a la derecha: foto, nombre y barra de vida de cada jugador (los caídos, apagados). Sin `hp`, solo la lista (sala de espera). */
+function Team({ mates, me }: { mates: Mate[]; me: string }) {
+  return (
+    <ul className="br-team" aria-label="Team">
+      {mates.map((m) => {
+        const hp = m.hp === undefined ? undefined : m.dead ? 0 : Math.max(0, Math.min(100, Math.round(m.hp)));
+        const n = Math.ceil((hp ?? 0) / 10);
+        return (
+          <li key={m.id} data-dead={m.dead || undefined} data-low={(hp !== undefined && hp <= 30 && !m.dead) || undefined} data-me={m.id === me || undefined}>
+            <Avatar src={avatarUrl(m.avatar)} name={m.name} />
+            <span className="br-team__n">{m.name}</span>
+            {hp !== undefined && (
+              <span className="br-team__hp" role="img" aria-label={m.dead ? 'down' : `health ${hp}%`}>
+                {'▮'.repeat(n)}
+                <span className="br-osd__dim">{'▮'.repeat(10 - n)}</span>
+              </span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** `on`, pero sin apagarse antes de que hayan pasado `ms` desde que se encendió: para que la pantalla de carga se llegue a ver. */
+function useHold(on: boolean, ms: number) {
+  const [hold, setHold] = useState(false);
+  const t0 = useRef(0);
+  useEffect(() => {
+    if (on) return (t0.current = performance.now()), setHold(true);
+    const id = setTimeout(() => setHold(false), Math.max(0, ms - (performance.now() - t0.current)));
+    return () => clearTimeout(id);
+  }, [on, ms]);
+  return on || hold;
 }
 
 export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin: () => void }) {
@@ -208,6 +287,7 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   const acct = useAccount();
   const [acctOpen, setAcctOpen] = useState(false); // el popup de la cuenta (SIGN IN / REGISTER / SIGN OUT)
   const [authMode, setAuthMode] = useState<AuthMode | null>(null); // el popup de inicio de sesión: abierto con su modo, o cerrado
+  const [welcome, setWelcome] = useState(false); // el aviso de la primera vez sin sesión
   const [pauseSettings, setPauseSettings] = useState(false); // los ajustes abiertos desde el menú de pausa
   const [toasts, setToasts] = useState<{ id: number; key: string }[]>([]);
   const server = useServer(net.sock);
@@ -218,16 +298,22 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   // la sala de espera 3D (game.ts/waiting.ts): lista, el ordenador abierto y lo que se lee de ella 10 veces por segundo
   const [waitReady, setWaitReady] = useState(false);
   const [computer, setComputer] = useState(false);
+  const [board, setBoard] = useState(false);
+  const [waitBag, setWaitBag] = useState(false);
+  const bag = useRef<(Cell | null)[]>([]); // disposición de la mochila: solo dura la sesión
   const [wh, setWh] = useState<WaitHud>(NO_WAIT);
   const roomRef = useRef(net.room);
   roomRef.current = net.room;
+  const invRef = useRef(net.inv);
+  invRef.current = net.inv;
+  const [result, setResult] = useState<RoundResult | null>(null);
   const mpRef = useRef(false);
   mpRef.current = mp;
   const screenRef = useRef(screen);
   screenRef.current = screen;
   const chatRef = useRef(false);
   chatRef.current = chat;
-  const endRef = useRef<(w: boolean) => void>(() => {});
+  const endRef = useRef<(r: RoundResult) => void>(() => {});
   const game = useRef<BackroomsGame>();
   const gl = useRef<HTMLDivElement>(null);
   const cursor = useRef<HTMLCanvasElement>(null);
@@ -239,13 +325,16 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   const started = useRef(false);
   const quitRef = useRef(onQuit);
   quitRef.current = onQuit;
+  const adminRef = useRef(false);
+  adminRef.current = !!acct.me?.admin;
+  useEffect(() => void (game.current && (game.current.adminOn = !!acct.me?.admin)), [acct.me?.admin]);
   const winRef = useRef(onWin);
   winRef.current = onWin;
 
   // la carga: mientras, la pantalla está quieta (en Firefox se compila aquí, ver still.ts)
   useEffect(() => {
-    reduced.current = window.matchMedia('(prefers-reduced-motion: reduce)').matches || settings.reduceMotion || (process.env.NODE_ENV === 'development' && new URLSearchParams(location.search).has('reduced'));
-    const dev = process.env.NODE_ENV === 'development' ? new URLSearchParams(location.search) : null;
+    reduced.current = window.matchMedia('(prefers-reduced-motion: reduce)').matches || settings.reduceMotion || (DEV_LOCAL && new URLSearchParams(location.search).has('reduced'));
+    const dev = DEV_LOCAL ? new URLSearchParams(location.search) : null;
     const coarse = window.matchMedia('(pointer: coarse)').matches;
     const low = coarse || !!dev?.has('low');
     setTouch(coarse);
@@ -262,17 +351,23 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
       g.setMuted(m);
       setMuted(m);
     } catch {}
+    g.adminOn = adminRef.current;
     g.setVolume(settings.volume);
     onSetting('volume', (v) => g.setVolume(v));
     onSetting('sfx', () => g.audio?.setMix());
     onSetting('ambient', () => g.audio?.setMix());
     g.vhs.uniforms.uAmount.value = settings.vhs;
     onSetting('vhs', (v) => (g.vhs.uniforms.uAmount.value = v));
-    // desarrollo: __game y __maze(semilla) en la consola
+    // gráficos: la escala de resolución rehace el tamaño del lienzo y el brillo es un filtro de la página
+    onSetting('resScale', () => dispatchEvent(new Event('resize')));
+    const bright = () => void (g.canvas.style.filter = settings.brightness === 1 ? '' : `brightness(${settings.brightness})`);
+    bright();
+    onSetting('brightness', bright);
+    // desarrollo local (no por túnel ni en producción, ver devGate.ts): __game y __maze(semilla) en la consola
     if (dev) Object.assign(window, { __game: g, __maze: (seed: number) => console.info(asciiMaze(seed)) });
     g.onPause = () => alive && setScreen(g.waiting ? 'waitpause' : 'pause');
     g.onDeath = () => alive && setScreen('crash');
-    g.onWin = () => (mpRef.current ? endRef.current(true) : winRef.current());
+    g.onWin = () => mpRef.current || winRef.current(); // en una sala la ronda la cierra el servidor (over), no subir al ascensor
     g.showTv(); // la sala oscura con la tele, mientras carga
     // un clic o una tecla: la cámara se acerca más deprisa
     const hurry = () => g.tv && (g.tv.speed = 3);
@@ -287,6 +382,8 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
         await new Promise((r) => setTimeout(r, 400));
         await g.diveIntoTv(); // y nos metemos en la tele: dentro está el menú
         if (alive) setScreen('menu');
+        if (alive && (dev?.has('pool') || dev?.has('poolmap'))) (setScreen('play'), g.devPool(dev.has('poolmap')));
+        else if (alive && dev?.has('runlevel')) (setScreen('play'), g.devRun()); // desarrollo: ?runlevel arranca «Run for your life» sin sala
       })
       .catch((e) => (console.error('load failed', e), alive && (setFailed(true), (g.tvFailed = true))))
       .finally(free);
@@ -316,16 +413,23 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   // lo que el OSD y los controles táctiles leen del juego, diez veces por segundo (el visor sale al subir la cámara)
   useEffect(() => {
     if (screen !== 'play') return;
+    // solo se vuelve a pintar el árbol si algo visible cambió (números redondeados; el reloj solo cuenta con el visor)
+    let prev = '';
     const id = setInterval(() => {
-      setHand(game.current?.player?.hand ?? 'none');
-      setHud(game.current?.hud);
+      const hd = game.current?.player?.hand ?? 'none';
+      setHand(hd === 'watergun' ? 'none' : hd);
+      const h = game.current?.hud;
+      const key = JSON.stringify(h, (k, v) => (k === 'time' && !h?.aiming ? 0 : (k === 'thumbs' || k === 'full') && Array.isArray(v) ? v.length : typeof v === 'number' ? Math.round(v * 200) : v));
+      if (key === prev) return;
+      prev = key;
+      setHud(h);
     }, 100);
     return () => clearInterval(id);
   }, [screen]);
 
   // Esc: en la pantalla de título vuelve al escritorio; en las salas, los logros y los ajustes, a la pantalla de título (sin un popup abierto)
   useEffect(() => {
-    if (!['menu', 'lobby', 'achv', 'settings'].includes(screen) || authMode || acctOpen) return;
+    if (!['menu', 'lobby', 'achv', 'settings'].includes(screen) || authMode || acctOpen || welcome) return;
     const key = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       if (screen === 'menu') return quitRef.current();
@@ -334,7 +438,26 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
     };
     addEventListener('keydown', key);
     return () => removeEventListener('keydown', key);
-  }, [screen, authMode, acctOpen]);
+  }, [screen, authMode, acctOpen, welcome]);
+
+  // la primera vez que se llega al título sin sesión (y con servidor, para poder entrar): una invitación a iniciar sesión; se recuerda que ya salió
+  useEffect(() => {
+    if (screen !== 'menu' || acct.status !== 'guest') return;
+    try {
+      if (localStorage.getItem('br-welcome')) return;
+      localStorage.setItem('br-welcome', '1');
+    } catch {
+      return; // sin almacenamiento no se puede recordar: mejor no insistir
+    }
+    setWelcome(true);
+  }, [screen, acct.status]);
+
+  useEffect(() => {
+    if (!welcome) return;
+    const key = (e: KeyboardEvent) => e.key === 'Escape' && (e.preventDefault(), setWelcome(false));
+    addEventListener('keydown', key);
+    return () => removeEventListener('keydown', key);
+  }, [welcome]);
 
   // Esc en la pausa: con los ajustes abiertos, los cierra; si no, sale de la pausa y sigue la partida
   useEffect(() => {
@@ -373,14 +496,14 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
     started.current = true;
     if (cursor.current) cursor.current.style.display = 'none';
     // desarrollo: &seed=N fija el laberinto
-    const fixed = process.env.NODE_ENV === 'development' ? Number(new URLSearchParams(location.search).get('seed')) : 0;
+    const fixed = DEV_LOCAL ? Number(new URLSearchParams(location.search).get('seed')) : 0;
     game.current!.start(fixed || (Math.random() * 2 ** 31) | 0);
     setScreen('play');
   }, []);
 
   // PLAY lleva a las salas; en desarrollo, con &seed=N sigue yendo directo a una partida en solitario
   const playClick = useCallback(() => {
-    if (process.env.NODE_ENV === 'development' && new URLSearchParams(location.search).get('seed')) return (enter(), start());
+    if (DEV_LOCAL && new URLSearchParams(location.search).get('seed')) return (enter(), start());
     setNotice('');
     setMp(true);
     setScreen('lobby');
@@ -389,10 +512,11 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   // ── el multijugador ──────────────────────────────────────────────────────
 
   // el final de una partida de sala: se para el juego y sale la pantalla de siempre; INSERT TAPE vuelve al lobby de la sala
-  endRef.current = (w: boolean) => {
+  endRef.current = (r: RoundResult) => {
     game.current?.stop();
     setChat(false);
-    setWon(w);
+    setWon(r.won);
+    setResult(r);
     setScreen('over');
   };
 
@@ -408,6 +532,7 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
 
   // con sala (al entrar o al volver de la partida): la sala de espera 3D; sin ella, la lista
   const inWait = screen === 'wait' || screen === 'waitpause';
+  const loadingRoom = useHold(inWait && !waitReady, 2400); // la carga de la sala, que dure lo bastante para verse
   useEffect(() => {
     if (screen === 'lobby' && net.room) setScreen('wait');
     else if (inWait && !net.room) setScreen('lobby');
@@ -438,10 +563,9 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   useEffect(() => {
     const s = net.sock;
     if (!s) return;
-    const on = ({ won: w }: { won: boolean }) => {
+    const on = (r: RoundResult) => {
       if (screenRef.current !== 'play' && screenRef.current !== 'pause') return;
-      if (w && game.current?.escaping) return; // quien sale ve su propio final (2,5 s)
-      endRef.current(w);
+      endRef.current(r);
     };
     s.on('over', on);
     return () => void s.off('over', on);
@@ -460,7 +584,7 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
     const room = roomRef.current, sock = net.sock;
     if (!room || !sock) return;
     enter();
-    game.current!.start(room.seed, { sock, id: sock.id!, life: DIFFICULTY[room.difficulty].life, players: room.players.length });
+    game.current!.start(room.seed, { sock, id: sock.id!, life: DIFFICULTY[room.difficulty].life, players: room.players.length, index: Math.max(0, room.players.findIndex((p) => p.id === sock.id)), inv: invRef.current ?? undefined, mission: room.mission, level: room.levelId, caps: room.caps });
     setNotice('');
     setComputer(false);
     setScreen('play');
@@ -474,6 +598,8 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
     if (!inWait || !g || !sock || !room) return;
     let alive = true;
     g.onWaitComputer = setComputer;
+    g.onWaitBoard = setBoard;
+    g.onWaitBag = setWaitBag;
     g.enterWaiting({ sock, id: sock.id! }, room)
       .then((ok) => alive && ok && setWaitReady(true))
       .catch((e) => {
@@ -486,8 +612,12 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
     return () => {
       alive = false;
       g.onWaitComputer = undefined;
+      g.onWaitBoard = undefined;
+      g.onWaitBag = undefined;
+      g.closeWaitBag();
       setWaitReady(false);
       setComputer(false);
+      setBoard(false);
       if (screenRef.current !== 'play') g.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -509,13 +639,23 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
   const phase = net.room?.phase;
   useEffect(() => {
     if (!inWait || !net.room) return;
-    game.current?.waitRoom(net.room);
+    game.current?.waitRoom(net.room, net.inv);
     if (phase !== 'lobby') {
+      game.current?.closeWaitBag();
       setChat(false);
       setComputer(false);
+      setBoard(false);
       if (screenRef.current === 'waitpause') setScreen('wait');
     }
-  }, [inWait, net.room, phase, waitReady]);
+  }, [inWait, net.room, net.inv, phase, waitReady]);
+
+  // el admin corta la ronda (vuelve el lobby sin pasar por «over»): de la partida a la sala de espera
+  useEffect(() => {
+    if (phase !== 'lobby' || !mpRef.current || (screenRef.current !== 'play' && screenRef.current !== 'pause')) return;
+    game.current?.stop();
+    setChat(false);
+    setScreen('wait');
+  }, [phase]);
 
   // empieza la partida: se espera a que la entrada por la puerta termine y se arranca
   useEffect(() => {
@@ -524,6 +664,26 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
     game.current!.waitDone().then(() => alive && enterRef.current());
     return () => void (alive = false);
   }, [inWait, phase]);
+
+  // la entrada por la puerta ha acabado (fase `starting`): empieza la votación de la misión y, mientras, se prepara el nivel y se avisa con `ready`
+  const [doorDone, setDoorDone] = useState(false);
+  const voting = phase === 'starting' && !!net.room?.vote;
+  useEffect(() => {
+    if (!inWait || phase !== 'starting') return void setDoorDone(false);
+    let alive = true;
+    game.current!.waitDone().then(() => alive && setDoorDone(true));
+    return () => void (alive = false);
+  }, [inWait, phase]);
+  useEffect(() => {
+    const room = roomRef.current, sock = net.sock;
+    if (!doorDone || !voting || !room || !sock) return;
+    game.current!.input.unlock(); // el cursor, para votar
+    let alive = true;
+    const done = () => alive && sock.emit('ready', true);
+    game.current!.warmLevel(room.seed, room.players.length, room.levelId).then(done, done);
+    return () => void (alive = false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [doorDone, voting, net.sock]);
 
   useEffect(() => {
     if (!inWait) return;
@@ -595,7 +755,7 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
 
   return (
     <div ref={root} className="br" data-screen={screen}>
-      {(screen === 'menu' || screen === 'settings' || screen === 'achv') && <Static still={reduced.current} scenes={game.current?.stills ?? []} />}
+      {(screen === 'menu' || screen === 'settings' || screen === 'achv' || (screen === 'lobby' && !net.room)) && <Static still={reduced.current} scenes={game.current?.stills ?? []} />}
       <div ref={gl} className="br-stage" />
       {screen === 'load' && (
         <div className="br-load br-sr" role="progressbar" aria-label="Loading Backrooms" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(progress * 100)}>
@@ -667,33 +827,46 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
           <AccountMenu acct={acct} onAuth={(m) => (setAcctOpen(false), openAuth(m))} onClose={() => setAcctOpen(false)} />
         </div>
       )}
+      {welcome && !authMode && (
+        <div className="br-modal">
+          <div className="br-dialog br-dialog--acct" role="dialog" aria-modal="true" aria-labelledby="br-wel-t">
+            <p className="br-lobby__head" id="br-wel-t">SAVE YOUR PROGRESS</p>
+            <p>YOU ARE PLAYING AS A GUEST. SIGN IN OR REGISTER TO KEEP YOUR ACHIEVEMENTS, STATS AND LOOK.</p>
+            <ul className="br-lobby__opts">
+              <li>
+                <button type="button" className="br-opt" autoFocus onClick={() => (setWelcome(false), openAuth('signin'))}>SIGN IN / REGISTER</button>
+              </li>
+              <li>
+                <button type="button" className="br-opt" onClick={() => setWelcome(false)}>LATER</button>
+              </li>
+            </ul>
+            <p className="br-lobby__dim br-lobby__keys">ESC LATER</p>
+          </div>
+        </div>
+      )}
       {authMode && (
         <div className="br-modal">
           <AuthScreen acct={acct} mode={authMode} onClose={() => setAuthMode(null)} />
         </div>
       )}
       <Toasts items={toasts} />
-      {(screen === 'lobby' || (inWait && !waitReady)) && <Static still={reduced.current} scenes={game.current?.stills ?? []} />}
-      {inWait && !waitReady && (
-        <p className="br-wait__load" role="status">
-          ENTERING THE ROOM…
-        </p>
+      {loadingRoom && <Static still={reduced.current} scenes={game.current?.stills ?? []} />}
+      {loadingRoom && (
+        <Loading
+          title={net.room ? `TAPE ${String(net.room.tape).padStart(3, '0')}` : 'ENTERING'}
+          steps={[
+            { label: 'SERVER LINK', done: net.link === 'online' },
+            { label: 'ROOM JOINED', done: !!net.room },
+            { label: 'LOADING THE ROOM', done: waitReady },
+          ]}
+        />
       )}
 
-      {screen === 'wait' && waitReady && net.room && (
+      {screen === 'wait' && waitReady && !loadingRoom && net.room && (
         <>
-          <div className="br-wait" role="status">
-            <p className="br-wait__head">
-              TAPE {String(net.room.tape).padStart(3, '0')}
-              <span className="br-lobby__dim"> · {net.room.name}</span>
-            </p>
-            <p>
-              CODE {net.room.code} · {net.room.public ? 'PUBLIC' : 'PRIVATE'} · SP {net.room.players.length}/{net.room.max} · {DIFF[net.room.difficulty]}
-            </p>
-            <p className="br-lobby__dim">{net.room.ownerId === net.me ? 'YOU ARE THE OWNER' : 'WAITING FOR THE OWNER…'}</p>
-            <ServerNotice server={server} />
-          </div>
-          {!wh.computer && !wh.entering && (
+          {!board && phase !== 'starting' && <WaitPanel room={net.room} me={net.me} sock={net.sock} />}
+          <ServerNotice server={server} />
+          {!wh.computer && !wh.board && !waitBag && !wh.entering && (
             <p className="br-hint" data-bad={wh.notice ? '' : undefined}>
               {wh.notice
                 ? wh.notice
@@ -704,11 +877,34 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
                     : ''}
             </p>
           )}
-          {wh.entering && <p className="br-hint">THE DOOR IS OPENING…</p>}
-          {!touch && !chat && !wh.computer && !wh.entering && <p className="br-wait__keys br-lobby__dim">WASD MOVE · SHIFT RUN · E USE · 1-4 EMOTES · ENTER CHAT · ESC PAUSE</p>}
+          {!touch && !chat && !wh.computer && !wh.board && !wh.entering && <p className="br-wait__keys br-lobby__dim">WASD MOVE · SHIFT RUN · SPACE JUMP · C CROUCH · E USE/BAG · G PICK UP · Y DROP · R READY · 1-4 ITEMS OR EMOTES · ENTER CHAT · ESC PAUSE</p>}
+          {!waitBag && !wh.computer && !wh.board && !wh.entering && game.current?.player && game.current.assets && (
+            <Hotbar inv={game.current.hud.inv} assets={game.current.assets} onUse={(i) => { const pl = game.current?.player; if (pl) (pl.hotSel = i), pl.useHot(i); }} />
+          )}
         </>
       )}
-      {screen === 'wait' && computer && net.room && <Computer room={net.room} me={net.me} sock={net.sock} hazmat={game.current?.assets?.gltf.hazmat} reduced={reduced.current} acct={acct} onClose={() => game.current?.closeComputer()} />}
+      {screen === 'wait' && computer && net.room && <Computer room={net.room} me={net.me} sock={net.sock} hazmat={game.current?.assets?.gltf.hazmat} assets={game.current?.assets} inv={net.inv} reduced={reduced.current} acct={acct} onClose={() => game.current?.closeComputer()} />}
+      {screen === 'wait' && waitBag && net.inv && game.current?.assets && (
+        <Inventory
+          open
+          inv={game.current.player ? game.current.hud.inv : waitInv(net.inv)}
+          assets={game.current.assets}
+          look={net.room?.players.find((p) => p.id === net.me)?.look}
+          reduced={reduced.current}
+          onPlace={(s, g) => game.current?.player?.place(s, g)}
+          onLight={() => game.current?.player?.toggleLight()}
+          bag={bag}
+          onHot={(i, id) => game.current?.player?.assign(i, id)}
+          onUse={(id) => {
+            const p = game.current?.player;
+            if (p && HOT[id]?.have(p.own)) HOT[id].use(p);
+          }}
+          onDrop={(id) => game.current?.dropItem(id as ItemId)}
+          onClose={() => game.current?.closeWaitBag()}
+        />
+      )}
+      {screen === 'wait' && board && net.room?.phase === 'lobby' && <BoardHint onClose={() => game.current?.closeComputer()} />}
+      {screen === 'wait' && doorDone && net.room?.phase === 'starting' && net.room.vote && <Board room={net.room} me={net.me} sock={net.sock} />}
       {screen === 'wait' && touch && game.current && !computer && !wh.entering && <Touch input={game.current.input} hand="none" aiming={false} />}
       {screen === 'waitpause' && (
         <div className="br-pause" role="dialog" aria-labelledby="br-pause-t">
@@ -734,35 +930,69 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
           </ul>
         </div>
       )}
-      {screen === 'over' && <End win={won} onInsert={() => setScreen('lobby')} />}
+      {screen === 'over' && <End win={won} result={result} me={net.me} onInsert={() => setScreen('lobby')} />}
       {(screen === 'play' || screen === 'pause') && hud?.aiming && <Osd hud={hud} />}
+      {screen === 'play' && hud?.scoped && !hud.bag && <div className="br-scope" aria-hidden="true" />}
       {screen === 'play' && hud?.spectating != null && (
         <div className="br-spectate" role="status">
           <p className="br-spectate__rec">
-            <span aria-hidden="true">●</span> SPECTATING · {hud.specView === 'chase' ? 'CHASE CAM' : 'POV'}
+            <span aria-hidden="true">●</span> SPECTATING · {hud.specView === 'chase' ? 'CHASE CAM' : hud.specView === 'free' ? 'FREE CAM' : 'POV'}
           </p>
           <ul className="br-spectate__list">
             {hud.watchList?.map((w, i) => (
               <li key={w.name + i} data-on={w.on || undefined} data-dead={w.dead || undefined}>
                 CH{i + 2} {w.name.toUpperCase()}
-                {w.dead && ' · FUERA'}
+                {w.dead && ' · OUT'}
               </li>
             ))}
             {!hud.watchList?.some((w) => !w.dead) && <li data-dead>NO SIGNAL</li>}
           </ul>
-          <p className="br-spectate__keys">← → CAMBIAR · V VISTA</p>
+          <p className="br-spectate__keys">← → SWITCH · V VIEW · C FREE CAM{hud.specView === 'free' ? ' · WASD FLY · SHIFT FAST' : ''}</p>
         </div>
       )}
+      {acct.me?.admin && (screen === 'play' || screen === 'wait') && <AdminConsole game={game} sock={net.sock} room={net.room} me={net.me} />}
       {(screen === 'play' || screen === 'wait') && mp && net.sock && (
         <div className="br-chatbox">
           <ChatLog msgs={msgs} fade={!chat} max={6} />
           {chat && <ChatInput sock={net.sock} onClose={closeChat} />}
         </div>
       )}
-      {screen === 'play' && hud && !hud.aiming && !hud.bag && hud.spectating == null && <Mission hud={hud} />}
+      {screen === 'play' && hud && !hud.aiming && !hud.bag && hud.spectating == null && !hud.totem.run && <Mission hud={hud} room={net.room} />}
+      {screen === 'play' && hud && !hud.aiming && !hud.bag && (
+        <Team
+          me={net.room ? net.me : 'me'}
+          mates={
+            net.room
+              ? net.room.players.map((p) => ({ id: p.id, name: p.name, avatar: p.avatar, dead: p.dead, hp: p.id === net.me ? hud.hp : hud.hps[p.id] ?? 100 }))
+              : [{ id: 'me', name: acct.me?.username ?? 'YOU', avatar: acct.me?.avatar ?? '', dead: hud.hp <= 0, hp: hud.hp }]
+          }
+        />
+      )}
+      {screen === 'play' && hud && !hud.bag && !hud.aiming && hud.spectating == null && game.current?.assets && (
+        <Hotbar
+          inv={hud.inv}
+          assets={game.current.assets}
+          onUse={(i) => {
+            const pl = game.current?.player;
+            if (!pl || game.current?.inPool) return void game.current?.poolHot(i);
+            pl.hotSel = i;
+            pl.useHot(i);
+          }}
+        />
+      )}
+      {screen === 'play' && hud && (
+        <TotemUi hud={hud} touch={touch} avatars={Object.fromEntries((net.room?.players ?? []).map((p) => [p.id, p.avatar]))} onPick={(id) => game.current?.useTotem(id)} onClose={() => game.current?.closeTotem()} />
+      )}
+      {screen === 'play' && hud?.note && !hud.bag && <p className="br-click">{hud.note}</p>}
+      {screen === 'play' && hud?.needClick && !hud.bag && <p className="br-click">CLICK TO CONTINUE</p>}
       {screen === 'play' && hud?.hint && !hud.bag && !hud.aiming && hud.spectating == null && (
         <p className="br-hint">
           [{touch ? 'GRAB' : 'G'}] PICK UP {hud.hint.toUpperCase()}
+        </p>
+      )}
+      {screen === 'play' && hud?.act && !hud.bag && !hud.aiming && hud.spectating == null && (
+        <p className="br-hint">
+          [{touch ? 'GRAB' : 'G'}] {hud.act}
         </p>
       )}
       {screen === 'play' && hud?.hide && !hud.bag && !hud.aiming && hud.spectating == null && (
@@ -778,14 +1008,23 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
           </div>
         </div>
       )}
-      {screen === 'play' && hud?.bag && game.current && (
+      {screen === 'play' && hud && game.current?.assets && (
         <Inventory
+          open={!!hud.bag}
           inv={hud.inv}
           assets={game.current.assets!}
           look={net.room?.players.find((p) => p.id === net.me)?.look}
           reduced={reduced.current}
           onPlace={(s, g) => game.current!.player?.place(s, g)}
           onLight={() => game.current!.player?.toggleLight()}
+          bag={bag}
+          onHot={(i, id) => game.current!.player?.assign(i, id)}
+          onUse={(id) => {
+            const p = game.current!.player;
+            if (p && HOT[id]?.have(p.own)) HOT[id].use(p);
+          }}
+          onDrop={(id) => game.current!.dropItem(id as ItemId)}
+          onTank={(on) => game.current!.setTank(on)}
           onClose={() => game.current!.closeBag()}
         />
       )}
@@ -827,7 +1066,7 @@ export default function Backrooms({ onQuit, onWin }: { onQuit: () => void; onWin
           <p className="br-crash__dim">the tape was eaten.</p>
         </div>
       )}
-      {showCross && ((screen === 'play' && hud && !hud.aiming && !hud.bag && hud.spectating == null && hud.hide !== 'leave') || (screen === 'wait' && waitReady && !wh.computer && !wh.entering)) && <Crosshair fixed />}
+      {showCross && ((screen === 'play' && hud && !hud.aiming && !hud.scoped && !hud.bag && hud.spectating == null && hud.hide !== 'leave') || (screen === 'wait' && waitReady && !wh.computer && !wh.entering)) && <Crosshair fixed />}
       {showFps && <Fps />}
       <canvas ref={cursor} className="br-cursor" aria-hidden="true" />
     </div>

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Me, Look } from '@backrooms/shared';
+import { AVATAR_MAX, AVATAR_PX, AVATAR_TYPES, type Me, type Look } from '@backrooms/shared';
 import { SERVER_URL } from './net';
 
 /*
@@ -34,6 +34,28 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
   }
   if (!r.ok) throw new ApiError(String(j.error ?? `Error ${r.status}`), r.status);
   return j as T;
+}
+
+/** La URL de una foto de perfil (`Member.avatar` / `Me.avatar`); undefined si no tiene. */
+export const avatarUrl = (ref?: string) => (ref ? `${SERVER_URL}/api/avatar/${ref}` : undefined);
+
+/** Recorta al centro un cuadrado y lo deja en AVATAR_PX con un webp (o jpeg) de menos de AVATAR_MAX bytes. */
+export async function cropAvatar(file: File): Promise<Blob> {
+  if (!/^image\/(png|jpe?g|webp|gif|bmp)$/i.test(file.type)) throw new ApiError('Use a PNG, JPEG or WebP image', 0);
+  const bmp = await createImageBitmap(file).catch(() => {
+    throw new ApiError('Could not read that image', 0);
+  });
+  const cv = Object.assign(document.createElement('canvas'), { width: AVATAR_PX, height: AVATAR_PX });
+  const side = Math.min(bmp.width, bmp.height);
+  cv.getContext('2d')!.drawImage(bmp, (bmp.width - side) / 2, (bmp.height - side) / 2, side, side, 0, 0, AVATAR_PX, AVATAR_PX);
+  bmp.close();
+  for (const type of AVATAR_TYPES) {
+    for (let q = 0.85; q > 0.3; q -= 0.2) {
+      const b = await new Promise<Blob | null>((ok) => cv.toBlob(ok, type, q));
+      if (b && b.type === type && b.size <= AVATAR_MAX) return b; // (si el navegador no sabe webp devuelve png: se prueba el siguiente tipo)
+    }
+  }
+  throw new ApiError('Image too complex, try another', 0);
 }
 
 /** loading: aún no se sabe; guest: sin cuenta; user: con sesión; offline: el servidor no responde (se juega de invitado). */
@@ -101,6 +123,21 @@ export function useAccount() {
         throw e;
       }
       setMe((m) => (m ? { ...m, loadout: l } : m));
+    },
+    /** Sube la foto de perfil (webp o jpeg ya recortado, ver cropAvatar). */
+    async setAvatar(img: Blob) {
+      let r: Response;
+      try {
+        r = await fetch(`${SERVER_URL}/api/avatar`, { method: 'POST', credentials: 'include', headers: { 'content-type': img.type }, body: img });
+      } catch {
+        throw new ApiError('Server not reachable', 0);
+      }
+      const j = await r.json().catch(() => ({}) as { error?: string; me?: Me });
+      if (!r.ok) throw new ApiError(String(j.error ?? `Error ${r.status}`), r.status);
+      enter(j.me);
+    },
+    async removeAvatar() {
+      enter((await call<{ me: Me }>('avatar-remove', {})).me);
     },
     /** Los logros de localStorage de antes (solo `backrooms` e `idiot` valen); el servidor concede los que puede justificar. */
     async importLegacy(keys: string[]) {

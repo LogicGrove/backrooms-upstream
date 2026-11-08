@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { type ClientToServer, type ServerToClient, type RoomView, type Status } from '@backrooms/shared';
+import { type ClientToServer, type ServerToClient, type Inventory, type RoomView, type Status } from '@backrooms/shared';
 
 /** El socket del cliente, tipado con el protocolo de shared/. */
 export type Sock = Socket<ServerToClient, ClientToServer>;
@@ -19,6 +19,8 @@ export function useNet(on: boolean) {
   const [sock, setSock] = useState<Sock>();
   const [link, setLink] = useState<Link>('connecting');
   const [room, setRoom] = useState<RoomView | null>(null);
+  /** Mi inventario según el servidor (lo que se conserva entre rondas: tienda, ascensor); null fuera de una sala. */
+  const [inv, setInv] = useState<Inventory | null>(null);
   useEffect(() => {
     if (!on) return;
     // websocket directo: con el polling por defecto (HTTP encadenado) un túnel añade retraso y suelta los paquetes en ráfagas; si el
@@ -35,6 +37,7 @@ export function useNet(on: boolean) {
     s.on('connect', () => (setLink('online'), ping()));
     s.on('disconnect', () => (setLink('offline'), setRoom(null)));
     s.on('room', setRoom);
+    s.on('inv', setInv);
     // al cerrar la pestaña, avisar y cerrar el socket a mano: no hay que esperar al latido del servidor (un túnel no siempre pasa el cierre)
     const bye = () => (s.emit('leave'), s.disconnect());
     addEventListener('pagehide', bye);
@@ -45,9 +48,10 @@ export function useNet(on: boolean) {
       s.disconnect();
       setSock(undefined);
       setRoom(null);
+      setInv(null);
     };
   }, [on]);
-  return { sock, link, room, setRoom, me: sock?.id ?? '' };
+  return { sock, link, room, setRoom, inv, me: sock?.id ?? '' };
 }
 export type Net = ReturnType<typeof useNet>;
 

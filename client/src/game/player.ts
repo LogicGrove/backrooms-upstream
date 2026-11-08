@@ -1,11 +1,17 @@
 import * as THREE from 'three';
 import type { Controls } from './input';
 import type { World } from './world';
+import { FLASH } from './lightmap';
 import type { Assets } from './game';
 import { settings } from '../settings';
+import { AMMO_PACK, HP_MAX, addItem, hasItem, removeItem, type Inventory, type ItemId } from '@backrooms/shared';
 import { Rig } from './rig';
+import { build } from './anim/core';
+import { HOT, HOT_SLOTS } from './quickslots';
 import { solveArm, solveTwoBone, poseFingers } from './ik';
 import { grips, type Hand, type View } from './grips';
+import { clone as skClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
+import { loadPoolKit, poolPart, tankFx } from './poolmap';
 
 /*
  * El jugador: el hazmat en primera persona. La cámara va a la altura de los ojos y el cuerpo debajo,
@@ -21,6 +27,12 @@ const wrap = (a: number) => THREE.MathUtils.euclideanModulo(a + Math.PI, Math.PI
 
 export const EYE = 1.62;
 const _rest = new THREE.Vector3(), _eye = new THREE.Vector3();
+/** Dónde va la linterna montada en el rifle (espacio del rifle: metros y grados). */
+const MOUNT = { pos: [0, -0.05, -0.12] as [number, number, number], rot: [0, 0, 0] as [number, number, number] };
+const _hl = new THREE.Vector3(), _hd = new THREE.Vector3(), _hq = new THREE.Quaternion();
+// la linterna se atenúa con la distancia a lo que ilumina: por debajo de FLASH_D0 la intensidad baja con d^decay (la luz recibida se queda
+// como a FLASH_D0 y no ciega contra el suelo o una pared cercana); más lejos, alcance completo
+const FLASH_D0 = 4, FLASH_DECAY = 1.2, _fo = new THREE.Vector3(), _ft = new THREE.Vector3(), _v0 = new THREE.Vector3();
 const REACH_T = 0.85; // lo que dura recoger algo, en segundos
 const WALK = 1.6, RUN = 3.6, JUMP = Math.sqrt(2 * 9.8 * 0.9), G = 9.8, R = 0.3;
 
@@ -45,14 +57,24 @@ export class Player {
   readonly pos = new THREE.Vector3();
   yaw = 0;
   pitch = 0;
-  hand: 'none' | 'camera' | 'gun' = 'none';
+  hand: 'none' | 'camera' | 'gun' | 'watergun' = 'none';
+  /** Lo que se lleva en la mano sin ser camcorder ni rifle (cinta de acordonar, radar); con uno de ellos la mano derecha queda libre. */
+  gadget: 'none' | 'caution' | 'radar' | 'totem' = 'none';
+  /** Un objeto suelto en la mano derecha, sin función de juego (lo usa Anim Studio para colocar su agarre). */
+  prop: 'none' | 'water' | 'soap' | 'tape' | 'ammo' = 'none';
   left: 'none' | 'flashlight' = 'flashlight';
   belt: 'none' | 'camera' | 'gun' = 'none';
   readonly has = { camera: false, gun: false };
+  /** Lleva el radar (un solo ejemplar por mapa: se lo queda quien lo coja). */
+  radar = false;
+  /** Tiene cinta de acordonar (se tiene o no; se usa sin gastarse). En una sala la da la tienda o el suelo; solo, se empieza con ella. */
+  caution = true;
   /** Correr lo gasta y a cero no se corre hasta recuperar un cuarto; la cordura la lleva game.ts. */
   stamina = 1;
   sanity = 1;
-  private winded = false;
+  /** Vida (0–100), sin regeneración: solo la devuelve una lata de Almond Water. En una sala la manda el servidor. */
+  hp = HP_MAX;
+  winded = false;
   ammo = 0; // en el cargador
   spare = 0; // de reserva
   flashOn = true;
@@ -61,6 +83,31 @@ export class Player {
   /** Segundos de luz que da una linterna (la dificultad de la sala lo cambia). */
   life = 90;
   spares = 0;
+  /** Latas de Almond Water y la barra de acceso rápido (ver quickslots.ts): el objeto de cada ranura y la elegida. */
+  water = 0;
+  /** Tótems de la vida que lleva (ver totem en shared y runlevel.ts). */
+  totem = 0;
+  readonly hot: (string | null)[] = ['caution', ...Array<null>(HOT_SLOTS - 1).fill(null)]; // la linterna va en la mano secundaria, no en la barra
+  hotSel = 0;
+  /** Pistola de agua (nivel 0): lo que queda en el depósito (0–1; aquí no hay donde rellenarlo), mojado/parado por la de otro, y el aviso del chorro (x, z, yaw). */
+  squirt = 1;
+  private wetT = 0;
+  private stunT = 0;
+  private jetAcc = 0;
+  private tankLvl?: (k: number) => void;
+  private jetT = 0;
+  jetting = false;
+  /** La barra de las Poolrooms la lleva PoolLevel: allí esta pistola no se saca. */
+  poolMode = false;
+  /** La bombona de buceo puesta en la espalda (si se tiene): se puede guardar en la mochila. */
+  tankOn = true;
+  get tankWorn() {
+    return this.poolGear.tank && this.tankOn;
+  }
+  onSquirt?: (x: number, z: number, yaw: number) => void;
+  private readonly jet = { pts: undefined as THREE.Points | undefined, v: new Float32Array(48 * 3), life: new Float32Array(48), i: 0 };
+  /** Se bebió una lata (sonido). */
+  onDrink?: () => void;
   private lens?: THREE.MeshStandardMaterial;
   // recoger: la vista se agacha hacia el objeto y la mano derecha baja a por él (0 → REACH_T)
   private reachAt?: THREE.Vector3;
@@ -68,19 +115,33 @@ export class Player {
   private reachCb?: () => void;
   /** Mirando por la camcorder (clic derecho). */
   aiming = false;
+  /** Mirando por la mira del rifle (ver update). */
+  scoped = false;
   /** El zoom de la camcorder, 1×–4×. */
   zoom = 1;
   private aimK = 0; // 0 → 1 mientras se sube la cámara al ojo
   onFall?: () => void;
   readonly rig: Rig;
   /** Lo que va en las manos, pegado a la cámara: la linterna a la izquierda y la cámara o la pistola a la derecha. */
-  readonly items = { flashlight: new THREE.Group(), camera: new THREE.Group(), gun: new THREE.Group() };
+  readonly items = { flashlight: new THREE.Group(), camera: new THREE.Group(), gun: new THREE.Group(), caution: new THREE.Group(), radar: new THREE.Group(), totem: new THREE.Group(), watergun: new THREE.Group(), water: new THREE.Group(), soap: new THREE.Group(), tape: new THREE.Group(), ammo: new THREE.Group() };
   speed = 0;
+  /** Agachado (C o Ctrl): ojos más bajos, mitad de velocidad, sin correr; las entidades te ven de menos lejos. `duckK` es la transición (0–1). */
+  duck = false;
+  private duckK = 0;
+  /** Consola de admin: velocidad x2 y atravesar paredes. */
+  speedMul = 1;
+  jumpMul = 1;
+  noclip = false;
   private velY = 0;
   private ground = true;
   private falling = false;
   private fell = false;
   private bob = 0;
+  private duckD = 0.6;
+  /** Segundos que lleva pulsado el botón de beber (la lata se bebe al mantener 0,5 s). */
+  private drinkT = 0;
+  /** En la sala de espera no se bebe (el servidor solo da vida en una ronda). */
+  drinkOff = false;
   private busy = 0; // segundos de una animación de una vez (recoger, recargar)
   private recoil = 0;
   /** El jugador ya no manda (muerto, en el ascensor): solo se pinta. */
@@ -89,6 +150,7 @@ export class Player {
   dead = false;
   private deadT = 0;
   private bones: Record<string, THREE.Bone | undefined>;
+  private torso: { b: THREE.Bone; q: THREE.Quaternion; p?: THREE.Vector3 }[] = [];
   /**
    * Escondite en un nicho de la pared: fuera, entrando (0,4 s), dentro, o saliendo. Dentro, la vista se agacha y se
    * acerca al fondo, no se camina, la mirada se limita a ±70° de la salida, la linterna se apaga y las manos bajan.
@@ -100,9 +162,17 @@ export class Player {
   private hideYaw = 0;
   private hideYaw0 = 0;
   private flashWas = false;
+  /** Distancia suavizada de la linterna a lo que ilumina (m). */
+  private flashD = 12;
 
   constructor(private world: World, assets: Assets, private camera: THREE.PerspectiveCamera, private flash: THREE.SpotLight, private reduced: boolean) {
     this.rig = new Rig(assets.gltf.hazmat);
+    const An = this.rig.useAnimator(); // el cuerpo lo lleva el Animator (anim/); sin el paquete de animaciones, los clips del modelo
+    if (An) {
+      // los brazos a sus agarres van por la pila de IK del Animator: con peso que sube y baja (sin saltos al coger o soltar) y sobre la animación
+      An.deferIk = true;
+      for (const s of ['Left', 'Right'] as const) An.ik.goals.push({ chain: `${s}Arm`, weight: 1, rate: 16, target: () => this.gripT[s], pole: () => this.gripT[s]?.pole ?? null });
+    }
     world.root.add(this.rig.root);
     this.bones = Object.fromEntries(['Head', 'Neck', 'RightArm', 'RightForeArm', 'RightHand', 'RightHandMiddle1', 'LeftArm', 'LeftForeArm', 'LeftHand', 'LeftHandMiddle1'].map((n) => [n, this.rig.bone(n)]));
     // los objetos de la mano, a escala de mano y apuntando al frente (-z): el rifle y la linterna
@@ -116,17 +186,48 @@ export class Player {
     });
     this.items.camera.add(fit(assets.gltf.camcorder.scene.clone(true), 0.2, Math.PI / 2));
     this.items.gun.add(fit(assets.gltf.gun.scene.clone(true), 0.72, Math.PI));
+    // lo de la barra rápida: el rollo de cinta americana, el radar (la radio de re1monsen) y el tótem; mismos agarres que lo demás
+    this.items.caution.add(fit(assets.gltf.duct.scene.clone(true), 0.11));
+    this.items.radar.add(fit(assets.gltf.radar.scene.clone(true), 0.16));
+    this.items.totem.add(fit(skClone(assets.gltf.totem.scene), 0.2));
+    // otros objetos que se llevan en la mano (la lata de Almond Water, la cinta VHS, la caja de balas; el jabón viene con el kit de las Poolrooms): hoy solo los usa Anim Studio para colocar los agarres
+    if (assets.gltf.water) this.items.water.add(fit(assets.gltf.water.scene.clone(true), 0.17));
+    if (assets.gltf.vhs) this.items.tape.add(fit(assets.gltf.vhs.scene.clone(true), 0.19));
+    this.items.ammo.add(new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.06, 0.06), new THREE.MeshStandardMaterial({ color: 0xb08d3a, roughness: 0.5, metalness: 0.5 })));
     this.placeItems(0);
     for (const it of Object.values(this.items)) camera.add(it);
-    this.items.camera.visible = this.items.gun.visible = false;
-    this.rig.play('Neutral Idle', 0);
+    for (const k of ['camera', 'gun', 'caution', 'radar', 'totem', 'watergun', 'water', 'soap', 'tape', 'ammo'] as const) this.items[k].visible = false;
+    // la pose de referencia: el primer fotograma de Neutral Idle. Con algo en las manos el torso y los dos brazos (hombros, brazos, manos y dedos)
+    // vuelven a ella cada fotograma, después del mezclador: los hombros no se mueven con el paso, y el IK parte siempre del mismo sitio y no
+    // hereda el giro del antebrazo del clip (que daba un salto en cada vuelta del ciclo de andar o correr)
+    this.rig.update(0);
+    for (const n of ['Hips', 'Spine', 'Spine1', 'Spine2']) this.keepPose(this.rig.bone(n), n === 'Hips');
+    for (const n of ['LeftShoulder', 'RightShoulder']) this.rig.bone(n)?.traverse((o) => this.keepPose(o as THREE.Bone, false));
+  }
+
+  private keepPose(b: THREE.Bone | undefined, pos: boolean) {
+    if (b) this.torso.push({ b, q: b.quaternion.clone(), p: pos ? b.position.clone() : undefined });
   }
 
   /** Cada objeto en su sitio respecto a la vista (grips.json); la camcorder, de su sitio en reposo al ojo según `k` (0–1). */
+  private swayK = 0;
+  /** Dónde llevar cada muñeca este fotograma (null = suelta). */
+  private gripT: Record<'Left' | 'Right', { pos: THREE.Vector3; quat: THREE.Quaternion; pole: THREE.Vector3 } | null> = { Left: null, Right: null };
   private placeItems(k: number) {
     const put = (it: THREE.Object3D, v: View, pos: THREE.Vector3) => (it.position.copy(pos), it.rotation.set(v.rot[0] * D, v.rot[1] * D, v.rot[2] * D));
     put(this.items.flashlight, grips.flashlight.view, _rest.fromArray(grips.flashlight.view.pos));
-    put(this.items.gun, grips.gun.view, _rest.fromArray(grips.gun.view.pos));
+    const gv = grips.gun.view;
+    put(this.items.gun, gv, _rest.fromArray(gv.pos).lerp(_eye.fromArray(gv.aim ?? gv.pos), k));
+    // con el rifle las dos manos van en él: la linterna va montada bajo el cañón y se mueve con el arma
+    if (this.hand === 'gun') {
+      const g = this.items.gun, f = this.items.flashlight;
+      f.position.copy(g.position).add(_hd.set(...MOUNT.pos).applyEuler(g.rotation));
+      f.rotation.copy(g.rotation);
+      f.rotateX(MOUNT.rot[0] * D), f.rotateY(MOUNT.rot[1] * D), f.rotateZ(MOUNT.rot[2] * D);
+    }
+    for (const k of ['caution', 'radar', 'totem', 'water', 'soap', 'tape', 'ammo'] as const) put(this.items[k], grips[k].view, _rest.fromArray(grips[k].view.pos));
+    const wv = grips.watergun.view;
+    put(this.items.watergun, wv, _rest.fromArray(wv.pos).lerp(_eye.fromArray(wv.aim ?? wv.pos), k));
     const cv = grips.camera.view;
     put(this.items.camera, cv, _rest.fromArray(cv.pos).lerp(_eye.fromArray(cv.aim ?? cv.pos), k));
   }
@@ -146,18 +247,26 @@ export class Player {
   }
 
   update(dt: number, c: Controls) {
-    if (this.dead) return this.fall(dt);
-    if (this.frozen) c = { ...c, move: new THREE.Vector2(), look: new THREE.Vector2(), jump: false, flash: false, swap: false, aim: false };
+    if (this.dead) {
+      // lo que la mano iba a coger (y el servidor ya dio) se entrega igualmente: si no, se pierde del inventario
+      if (this.reachCb) (this.reachCb(), (this.reachCb = undefined));
+      this.reachAt = undefined;
+      return this.fall(dt);
+    }
+    if (this.frozen) c = { ...c, move: new THREE.Vector2(), look: new THREE.Vector2(), jump: false, flash: false, swap: false, slot: -1, wheel: 0, use: false, aim: false };
     const hs = this.hideState;
     if (hs !== 'out') c = { ...c, move: new THREE.Vector2(), jump: false, flash: false, swap: false, aim: false, run: false };
     // mirar por la cámara: se sube al ojo, la vista se cierra y, ya arriba, se mira a través (el modelo se esconde)
-    const want = c.aim && this.hand === 'camera';
+    const want = c.aim && (this.hand === 'camera' || this.hand === 'gun' || this.hand === 'watergun');
     this.aimK = THREE.MathUtils.clamp(this.aimK + (want ? dt : -dt) * 6, 0, 1);
-    this.aiming = this.aimK > 0.85;
-    this.zoom = this.aiming ? THREE.MathUtils.clamp(this.zoom + c.zoom * 0.5, 1, 4) : 1;
+    this.aiming = this.aimK > 0.85 && this.hand === 'camera'; // (rifle y pistola de agua solo acercan el arma al ojo)
+    // el rifle apuntado es una mira de verdad: la vista se cierra (zoom 1–2,5 con la rueda), el arma y los brazos no se ven y el HUD pone la retícula
+    this.scoped = this.aimK > 0.85 && this.hand === 'gun';
+    this.zoom = this.aiming || this.scoped ? THREE.MathUtils.clamp((this.zoom < 1.5 ? 1.8 : this.zoom) + c.zoom * 0.5, 1.5, this.scoped ? 3 : 4) : 1;
     const k = this.aimK * this.aimK * (3 - 2 * this.aimK);
     this.placeItems(k);
     this.items.camera.visible = this.hand === 'camera' && !this.aiming;
+    this.items.gun.visible = this.hand === 'gun' && !this.scoped;
     const fov = THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(settings.fov / 2)) / THREE.MathUtils.lerp(1, this.zoom * 1.25, k)));
     if (Math.abs(fov - this.camera.fov) > 0.01) (this.camera.fov = fov), this.camera.updateProjectionMatrix();
     this.yaw -= c.look.x;
@@ -173,29 +282,46 @@ export class Player {
       if (this.charge === 0) this.flashOn = false;
     }
     if (c.swap) this.swap();
+    if (c.slot >= 0) (this.hotSel = c.slot), this.useHot(c.slot);
+    if (c.wheel) this.pickHot((this.hotSel + Math.sign(c.wheel) + HOT_SLOTS) % HOT_SLOTS);
+    if (c.use) this.useHot(this.hotSel);
+    // la lata en la mano: mantener su tecla (o X, o el clic) medio segundo para beberla; soltar y volver a mantener para otra
+    const wi = this.hot.indexOf('water');
+    const held = !this.drinkOff && this.prop === 'water' && this.water > 0 && ((wi >= 0 && c.slotHeld === wi) || !!c.useHeld || !!c.fireHeld);
+    this.drinkT = held ? this.drinkT + dt : 0;
+    if (this.drinkT >= 0.5) (this.drinkT = -1e9), this.drink();
+    this.wetT = Math.max(0, this.wetT - dt);
+    this.stunT = Math.max(0, this.stunT - dt);
+    this.spray(dt, c);
 
     // andar: hacia donde se mira, chocando eje a eje con las paredes
-    const moving = c.move.length() > 0.05, run = c.run && moving && !this.winded;
+    // agacharse: no con la linterna de pie en un nicho ni en el aire; al soltar, vuelve a levantarse
+    this.duck = !!c.crouch && !c.run && hs === 'out' && this.ground; // (correr, Shift, manda: Ctrl+Shift = sprint)
+    this.duckK += ((this.duck ? 1 : 0) - this.duckK) * Math.min(1, dt * 10);
+    const moving = c.move.length() > 0.05, run = c.run && moving && !this.winded && !this.duck;
     // ~9 s corriendo; se recupera en ~6 s andando y ~4 s parado; agotado, no se corre hasta el 30 %
     this.stamina = THREE.MathUtils.clamp(this.stamina + dt * (run ? -1 / 9 : moving ? 1 / 6 : 1 / 4), 0, 1);
     if (this.stamina <= 0) this.winded = true;
     else if (this.stamina > 0.3) this.winded = false;
-    const speed = moving ? (run ? RUN : WALK) * Math.min(1, c.move.length()) : 0;
+    const speed = moving ? (run ? RUN : WALK) * Math.min(1, c.move.length()) * this.speedMul * (this.duck ? 0.5 : 1) * (this.stunT > 0 ? 0 : this.wetT > 0 ? 0.5 : 1) : 0;
     const f = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)), r = new THREE.Vector3(-f.z, 0, f.x);
     const v = f.multiplyScalar(c.move.y).add(r.multiplyScalar(c.move.x));
     if (v.lengthSq() > 0) v.normalize().multiplyScalar(speed * dt);
-    if (!this.blocked(this.pos.x + v.x, this.pos.z)) this.pos.x += v.x;
-    if (!this.blocked(this.pos.x, this.pos.z + v.z)) this.pos.z += v.z;
+    if (this.noclip || !this.blocked(this.pos.x + v.x, this.pos.z)) this.pos.x += v.x;
+    if (this.noclip || !this.blocked(this.pos.x, this.pos.z + v.z)) this.pos.z += v.z;
     this.speed = speed;
 
     // saltar y caer: sobre un hueco no hay suelo
-    if (c.jump && this.ground && !this.falling) (this.velY = JUMP), (this.ground = false);
-    const floor = this.falling || this.world.voidAt(this.pos.x, this.pos.z) ? -Infinity : 0;
-    this.velY -= G * dt;
-    this.pos.y += this.velY * dt;
-    if (this.pos.y <= floor) (this.pos.y = floor), (this.velY = 0), (this.ground = true);
-    else if (this.pos.y < -0.2) this.falling = true;
-    if (this.pos.y < -3 && !this.fell) (this.fell = true), this.onFall?.();
+    if (this.poolMode) (this.velY = 0), (this.ground = true), (this.falling = false); // (en las Poolrooms la altura la pone PoolLevel: aquí no hay suelo en 0, y la gravedad hacía temblar el cuerpo en el agua)
+    else {
+      if (c.jump && this.ground && !this.falling) (this.velY = JUMP * this.jumpMul), (this.ground = false);
+      const floor = this.falling || this.world.voidAt(this.pos.x, this.pos.z) ? -Infinity : 0;
+      this.velY -= G * dt;
+      this.pos.y += this.velY * dt;
+      if (this.pos.y <= floor) (this.pos.y = floor), (this.velY = 0), (this.ground = true);
+      else if (this.pos.y < -0.2) this.falling = true;
+      if (this.pos.y < -3 && !this.fell) (this.fell = true), this.onFall?.();
+    }
 
     // el escondite: de la boca al fondo (o al revés) en 0,4 s, y la vista se agacha (hk: 0 de pie, 1 dentro)
     let hk = hs === 'hidden' ? 1 : 0;
@@ -228,25 +354,38 @@ export class Player {
     body.position.y -= 0.45 * rk + 0.9 * hk;
     body.rotation.y = this.yaw + Math.PI;
     body.visible = hk < 0.3;
-    const idle = this.hand === 'gun' ? 'Rifle Idle' : 'Neutral Idle';
+    // el vaivén de una cámara de mano al andar (el cuerpo lo sigue en vertical: los hombros, y con ellos los brazos, no se mueven respecto a la vista)
+    this.bob += dt * (speed > 2 ? 11 : 7) * (speed > 0 ? 1 : 0);
+    const amp = this.reduced || !this.ground ? 0 : speed > 2 ? 0.045 : speed > 0 ? 0.025 : 0;
+    const bobY = Math.sin(this.bob * 2) * amp;
+    // agachado: con el Animator la cadera ya baja con la animación (y los pies siguen en el suelo: bajar también el cuerpo los hundía); la vista baja lo mismo que ella (en reposo 0,57 m, andando 0,2), y así los hombros no se alejan de las manos
+    // sin Animator (rig antiguo) el cuerpo baja casi lo que la vista
+    const AN = this.rig.animator;
+    this.duckD += ((AN ? THREE.MathUtils.lerp(0.57, 0.2, Math.min(1, speed / 0.8)) : 0.6) - this.duckD) * Math.min(1, dt * 6);
+    body.position.y += bobY - (AN ? 0 : 0.5) * this.duckK;
     this.busy -= dt;
-    if (this.busy <= 0) {
-      const a = this.rig.play(speed > 2 ? 'Slow Run' : speed > 0 ? 'Walking222' : idle);
-      if (a) a.timeScale = speed > 0 ? speed / (speed > 2 ? RUN : WALK) : 1;
+    const A = this.rig.animator, holding = this.hand !== 'none' || this.left === 'flashlight' || this.gadget !== 'none';
+    if (A) {
+      // los parámetros del árbol de animación; con algo en las manos, la capa «hold» fija torso y brazos (el vaivén lo pone el balanceo de más abajo)
+      A.p.speed = speed;
+      A.p.crouch = this.duck ? 1 : 0;
+      A.p.air = this.ground ? 0 : 1;
+      A.p.vy = this.velY;
+      A.p.hold += ((holding ? 1 : 0) - A.p.hold) * (1 - Math.exp(-dt * 12));
     }
     this.rig.update(dt);
+    // con algo en las manos el torso y los brazos se quedan quietos (ver `torso`); el vaivén lo pone el balanceo de más abajo
+    body.updateMatrixWorld(true);
     this.bones.Head?.scale.setScalar(0.001);
     // con la cámara en el ojo, los brazos no se ven (estarían delante de la lente)
-    for (const s of ['LeftArm', 'RightArm']) this.bones[s]?.scale.setScalar(this.aiming ? 0.001 : 1);
+    for (const s of ['LeftArm', 'RightArm']) this.bones[s]?.scale.setScalar(this.aiming || this.scoped ? 0.001 : 1);
     this.bones.Neck?.scale.setScalar(0.5);
 
     // la cámara: los ojos, con el vaivén de una cámara de mano al andar
-    this.bob += dt * (speed > 2 ? 11 : 7) * (speed > 0 ? 1 : 0);
-    const amp = this.reduced || !this.ground ? 0 : speed > 2 ? 0.045 : speed > 0 ? 0.025 : 0;
     const neck = Math.sin(down * 1.45) * 0.12;
     // (agachado en un nicho, algo hacia el fondo: de espaldas a la salida)
     const bx = Math.sin(this.hideYaw) * 0.32 * hk, bz = Math.cos(this.hideYaw) * 0.32 * hk;
-    this.camera.position.set(this.pos.x - Math.sin(this.yaw) * neck + bx, this.pos.y + EYE - 0.5 * rk - 0.82 * hk + Math.sin(this.bob * 2) * amp, this.pos.z - Math.cos(this.yaw) * neck + bz);
+    this.camera.position.set(this.pos.x - Math.sin(this.yaw) * neck + bx, this.pos.y + EYE - 0.5 * rk - 0.82 * hk - this.duckD * this.duckK + bobY, this.pos.z - Math.cos(this.yaw) * neck + bz);
     this.recoil = Math.max(0, this.recoil - dt * 5);
     // al recoger, la vista se va al objeto
     let pitch = this.pitch;
@@ -256,29 +395,65 @@ export class Player {
     }
     this.camera.rotation.set(pitch + this.recoil * 0.06, this.yaw, Math.sin(this.bob) * amp * 0.3, 'YXZ');
     this.camera.updateMatrixWorld();
+    // ese movimiento, del espacio del cuerpo al de la vista, sumado a cada objeto (y los brazos lo siguen: van a sus agarres)
+    // (procedural, a la cadencia del paso, con la amplitud suavizada: sin saltos al empezar, parar ni al acabar el ciclo)
+    const swayT = this.reduced || !this.ground || this.aiming ? 0 : speed > 2 ? 1 : speed > 0 ? 0.6 : 0;
+    this.swayK += (swayT - this.swayK) * (1 - Math.exp(-dt * 6));
+    if (this.swayK > 0.001) {
+      const a = 0.014 * this.swayK;
+      _hd.set(Math.cos(this.bob) * a, Math.sin(this.bob * 2) * a * 1.2, 0);
+      for (const it of Object.values(this.items)) it.position.add(_hd);
+    }
 
     // los brazos, a sus agarres: la muñeca al punto, la mano con su orientación y los dedos cerrados (ver ik.ts y grips.ts)
     const q = this.camera.quaternion;
     const grip = (side: 'Left' | 'Right', item: THREE.Object3D, h: Hand) => {
+      if (this.rig.animator?.playing) return; // bailando: los brazos son de la animación
       const arm = this.bones[side + 'Arm'], fore = this.bones[side + 'ForeArm'], hand = this.bones[side + 'Hand'];
       if (!arm || !fore || !hand) return;
       const pole = arm.getWorldPosition(new THREE.Vector3()).add(V(...h.pole).applyQuaternion(q));
       item.updateWorldMatrix(true, false);
       const want = item.getWorldQuaternion(new THREE.Quaternion()).multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(h.rot[0] * D, h.rot[1] * D, h.rot[2] * D)));
-      solveArm({ shoulder: this.rig.bone(side + 'Shoulder'), arm, fore, hand }, item.localToWorld(V(...h.pos)), pole, want);
+      const at = item.localToWorld(V(...h.pos));
+      if (this.rig.animator) this.gripT[side] = { pos: at, quat: want, pole };
+      else solveArm({ shoulder: this.rig.bone(side + 'Shoulder'), arm, fore, hand }, at, pole, want);
       poseFingers((n) => this.rig.bone(n), side, h.curl, h.spread);
     };
-    const two = this.hand === 'gun' || (this.hand === 'camera' && this.aiming);
+    this.gripT.Left = this.gripT.Right = null;
+    const gd = this.gadget !== 'none' ? grips[this.gadget] : undefined;
+    const two = this.hand === 'gun' || (this.hand === 'camera' && this.aiming) || (this.hand === 'none' && !!gd?.left);
     const lamp = this.left === 'flashlight' && hk < 0.3;
-    this.items.flashlight.visible = lamp && !two;
+    this.items.flashlight.visible = lamp && !(this.hand === 'camera' && this.aiming) && !this.scoped; // la linterna siempre se ve (con el rifle, montada); solo la lente de la camcorder la tapa
     if (!two && lamp && grips.flashlight.left) grip('Left', this.items.flashlight, grips.flashlight.left);
     if (this.hand !== 'none' && hk < 0.3) {
       const it = this.items[this.hand], g = grips[this.hand];
-      it.visible = !rk && !(this.hand === 'camera' && this.aiming); // la derecha suelta lo que lleva mientras recoge
+      it.visible = !rk && !(this.hand === 'camera' && this.aiming) && !this.scoped && (this.hand !== 'watergun' || it.children.length > 0); // la derecha suelta lo que lleva mientras recoge
       if (!rk && g.right) grip('Right', it, g.right);
-      if (two && g.left) grip('Left', it, g.left);
+      if (two && !rk && g.left) grip('Left', it, g.left);
+    }
+    for (const k of ['caution', 'radar', 'totem', 'water', 'soap', 'tape', 'ammo'] as const) this.items[k].visible = false;
+    if (this.prop === 'soap' && !this.items.soap.children.length) {
+      const m = poolPart('soap');
+      if (m) this.items.soap.add(fit(m.clone(true), 0.2));
+      else void loadPoolKit();
+    }
+    const pg = this.prop !== 'none' && this.hand === 'none' && this.gadget === 'none' && hk < 0.3 && !this.aiming ? grips[this.prop] : undefined;
+    if (pg) {
+      // un objeto suelto en la mano (lata, jabón, cinta VHS, balas)
+      const it = this.items[this.prop as 'water'];
+      it.visible = !rk;
+      if (!rk && pg.right) grip('Right', it, pg.right);
+      if (!rk && pg.left) grip('Left', it, pg.left);
+    }
+    if (gd && this.hand === 'none' && hk < 0.3 && !this.aiming) {
+      // cinta, radar o tótem en la mano derecha (y la izquierda si su agarre la trae)
+      const it = this.items[this.gadget as 'caution'];
+      it.visible = !rk;
+      if (!rk && gd.right) grip('Right', it, gd.right);
+      if (!rk && gd.left) grip('Left', it, gd.left);
     }
     if (hk >= 0.3) for (const it of Object.values(this.items)) it.visible = false;
+    this.rig.animator?.ik.run(dt); // (los agarres y el resto del IK, ya con los objetivos de este fotograma)
     if (rk && this.reachAt) {
       // la mano derecha, de su sitio en reposo hasta el objeto, con los dedos hacia abajo
       const arm = this.bones.RightArm, fore = this.bones.RightForeArm, hand = this.bones.RightHand;
@@ -294,8 +469,26 @@ export class Player {
     // las pilas se acaban: por debajo del 25 % da menos y a ratos parpadea
     const low = this.charge < 0.25, flick = low && Math.random() > 0.3 + this.charge * 2 ? 0.15 : 1;
     const dim = (0.35 + 0.65 * Math.min(1, this.charge / 0.25)) * flick;
-    this.flash.intensity = this.lightOn ? 26 * dim : 0;
+    if (this.lightOn) {
+      this.flashD += (this.flashDist() - this.flashD) * Math.min(1, dt * 12);
+      // la luz sale 0,5 m por delante de los ojos; con una pared cerca se queda dentro de ella: se echa atrás para que quede delante
+      const out = THREE.MathUtils.clamp(this.flashD * 0.4, 0.06, 0.5);
+      this.flash.position.z = -out;
+      const near = THREE.MathUtils.clamp((this.flashD - out) / FLASH_D0, 0.1, 1);
+      this.flash.intensity = FLASH * dim * near ** FLASH_DECAY;
+      this.flash.angle = THREE.MathUtils.lerp(0.9, 0.55, near); // de cerca el cono se abre: menos hotspot
+    } else this.flash.intensity = 0;
     this.lens?.emissive.setScalar(this.lightOn ? dim : 0.04);
+  }
+
+  /** A qué distancia de los ojos cae lo que ilumina la linterna: el suelo o la primera pared por delante (se marcha por la rejilla, hasta 12 m). */
+  private flashDist() {
+    this.camera.getWorldPosition(_fo);
+    this.flash.target.getWorldPosition(_ft).sub(this.flash.getWorldPosition(_v0)).normalize();
+    let t = _ft.y < -0.01 ? -_fo.y / _ft.y : Infinity;
+    t = Math.min(t, 12);
+    for (let s = 0.2; s < t; s += 0.2) if (this.world.solid(_fo.x + _ft.x * s, _fo.z + _ft.z * s)) return s;
+    return t;
   }
 
   /**
@@ -309,15 +502,8 @@ export class Player {
     if (first) for (const it of Object.values(this.items)) it.visible = false;
     const body = this.rig.root, back = new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw)).multiplyScalar(0.16);
     body.position.copy(this.pos).add(back);
-    const clip = ['Dying', 'Falling Back Death', 'Death'].find((n) => this.rig.action(n));
-    if (clip) {
-      if (first) this.rig.play(clip, 0.1, true);
-      body.rotation.set(0, this.yaw + Math.PI, 0);
-    } else {
-      const k = Math.min(1, this.deadT / 0.75);
-      body.rotation.set(-k * k * (Math.PI / 2) * 0.96, this.yaw + Math.PI, 0, 'YXZ');
-      if (first) this.rig.play('Neutral Idle', 0.2);
-    }
+    if (first) this.rig.animator?.playOver(build({ type: 'clip', clip: 'Standing React Death Backward', loop: false }), { fadeIn: 0.1, hold: true });
+    body.rotation.set(0, this.yaw + Math.PI, 0);
     this.rig.update(dt);
     for (const s of ['Head', 'Neck', 'LeftArm', 'RightArm']) this.bones[s]?.scale.setScalar(1);
   }
@@ -356,6 +542,18 @@ export class Player {
     return this.hideState === 'hidden';
   }
 
+  /** Vuelve a la partida (el Tótem de la vida): de pie en `at`, con todo lo que llevaba y la vida llena. */
+  revive(at: THREE.Vector3, yaw: number) {
+    this.dead = this.frozen = this.fell = this.falling = false;
+    this.deadT = 0;
+    this.hp = HP_MAX;
+    this.stamina = 1;
+    this.winded = false;
+    this.rig.root.rotation.set(0, 0, 0);
+    this.rig.animator?.stopOver();
+    this.spawn(at, yaw);
+  }
+
   /** Donde queda el cuerpo tirado (el centro, en el suelo). */
   get corpse() {
     return this.pos.clone().add(new THREE.Vector3(Math.sin(this.yaw), 0, Math.cos(this.yaw)).multiplyScalar(0.9));
@@ -371,9 +569,27 @@ export class Player {
     return true;
   }
 
+  /** Variante de animación puesta (cosmético; id de anim/variants.json, '' = ninguna). */
+  setVariant(id: string) {
+    this.rig.animator?.setVariant(id);
+  }
+  get variant() {
+    return this.rig.animator?.variant ?? '';
+  }
+  /** Baile de victoria (id de anim/dances.json) o '' para dejarlo. */
+  dance(id: string) {
+    const A = this.rig.animator;
+    if (!A) return;
+    if (id) A.playOver(id, { hold: true });
+    else A.stopOver();
+    A.p.hold = 0;
+  }
+  get dancing() {
+    return this.rig.animator?.playing ? this.rig.animator.current : '';
+  }
+
   act(name: string) {
-    const a = this.rig.play(name, 0.15, true);
-    if (a) (a.timeScale = 1.6), (this.busy = a.getClip().duration / 1.6);
+    this.rig.animator?.playOver(build({ type: 'clip', clip: name, rate: 1.6, loop: false }), { fadeIn: 0.15, fadeOut: 0.15 });
   }
 
   /** El retroceso del disparo: la vista salta un poco hacia arriba y el rifle hacia atrás. */
@@ -381,11 +597,76 @@ export class Player {
     this.recoil = 1;
   }
 
+  /** Pistola de agua: el modelo (viene con el kit de las Poolrooms: se baja la primera vez), y el chorro mientras se mantiene el clic. */
+  private spray(dt: number, c: Controls) {
+    const wg = this.items.watergun;
+    if (this.hand === 'watergun' && !wg.children.length) {
+      const m = poolPart('watergun');
+      if (m) (wg.add(fit(m.clone(true), 0.4)), (this.tankLvl = tankFx(wg)));
+      else void loadPoolKit();
+    }
+    if (wg.visible) this.tankLvl?.(this.squirt); // el agua dentro del depósito
+    this.jetting = this.hand === 'watergun' && !this.dead && !this.frozen && this.hideState === 'out' && !!(c.fire || c.fireHeld) && this.squirt > 0;
+    const J = this.jet;
+    if (!J.pts) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(48 * 3).fill(-999), 3));
+      J.pts = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.12, color: 0xbfe8ff, transparent: true, opacity: 0.8, depthWrite: false }));
+      J.pts.frustumCulled = false;
+      this.world.root.add(J.pts);
+    }
+    const pos = J.pts.geometry.getAttribute('position') as THREE.BufferAttribute;
+    if (this.jetting) {
+      this.squirt = Math.max(0, this.squirt - dt / 6);
+      this.jetAcc += dt * 48;
+      const cp = Math.cos(this.pitch), fx = -Math.sin(this.yaw) * cp, fy = Math.sin(this.pitch), fz = -Math.cos(this.yaw) * cp;
+      while (this.jetAcc >= 1) {
+        this.jetAcc--;
+        const k = J.i++ % 48, r = () => (Math.random() - 0.5) * 0.7;
+        pos.setXYZ(k, this.pos.x + fx * 0.6 + Math.cos(this.yaw) * 0.18, this.pos.y + EYE - 0.2 + fy * 0.6, this.pos.z + fz * 0.6 - Math.sin(this.yaw) * 0.18);
+        // converge en el punto que apunta la mira (a 9 m), con algo de arriba para compensar la caída
+        const dx = this.pos.x + fx * 9 - pos.getX(k), dy = this.pos.y + EYE + fy * 9 - pos.getY(k), dz = this.pos.z + fz * 9 - pos.getZ(k), dl = Math.hypot(dx, dy, dz) || 1;
+        J.v[k * 3] = (dx / dl) * 11 + r();
+        J.v[k * 3 + 1] = (dy / dl) * 11 + r() * 0.6 + 2.2;
+        J.v[k * 3 + 2] = (dz / dl) * 11 + r();
+        J.life[k] = 0.55;
+      }
+      if ((this.jetT -= dt) <= 0) (this.jetT = 1 / 15), this.onSquirt?.(this.pos.x, this.pos.z, this.yaw);
+    } else this.jetAcc = 0;
+    for (let k = 0; k < 48; k++) {
+      if (J.life[k] <= 0) continue;
+      if ((J.life[k] -= dt) <= 0) {
+        pos.setY(k, -999);
+        continue;
+      }
+      J.v[k * 3 + 1] -= 6 * dt;
+      pos.setXYZ(k, pos.getX(k) + J.v[k * 3] * dt, pos.getY(k) + J.v[k * 3 + 1] * dt, pos.getZ(k) + J.v[k * 3 + 2] * dt);
+    }
+    pos.needsUpdate = true;
+  }
+
+  /** Le ha dado la pistola de agua de otro (el servidor lo avisa): mojado frena a la mitad, parado no se mueve. */
+  hit(kind: 'wet' | 'stun', ms: number) {
+    if (kind === 'stun') this.stunT = ms / 1000;
+    else this.wetT = ms / 1000;
+  }
+
   hold(h: Player['hand']) {
+    if (h === 'watergun' && this.poolMode) return;
     this.hand = h;
+    if (h !== 'none') (this.gadget = 'none'), (this.prop = 'none');
     this.items.camera.visible = h === 'camera';
-    if (h !== 'camera') this.aimK = 0;
+    if (h !== 'camera' && h !== 'gun' && h !== 'watergun') this.aimK = 0;
     this.items.gun.visible = h === 'gun';
+    this.items.watergun.visible = h === 'watergun';
+  }
+
+  /** Sacar la cinta o el radar (o guardarlo si ya está en la mano): deja libre la mano derecha. */
+  equipGadget(g: 'caution' | 'radar' | 'totem') {
+    if (this.gadget === g) return void (this.gadget = 'none');
+    this.hold('none');
+    this.prop = 'none';
+    this.gadget = g;
   }
 
   /** F o el interruptor: enciende o apaga; con la linterna gastada, saca una de repuesto si hay. */
@@ -404,8 +685,129 @@ export class Player {
     return this.flashOn && this.left === 'flashlight';
   }
 
-  /** Q o la rueda: lo de la mano derecha al cinturón y lo del cinturón a la mano. */
+  /** Usar lo de la ranura `i` (si se tiene). */
+  useHot(i: number) {
+    const d = this.hot[i] ? HOT[this.hot[i]!] : undefined;
+    if (d?.have(this.own)) d.use(this);
+  }
+
+  /** La rueda deja elegida la ranura `i` y equipa lo que se equipa solo (camcorder, rifle). */
+  pickHot(i: number) {
+    this.hotSel = i;
+    const d = this.hot[i] ? HOT[this.hot[i]!] : undefined;
+    if (d?.have(this.own)) d.pick?.(this);
+  }
+
+  /** Poner `id` en la ranura `i` (o vaciarla con null); un objeto solo está en una ranura. */
+  assign(i: number, id: string | null) {
+    if (id && !HOT[id]) return;
+    if (id) for (let k = 0; k < HOT_SLOTS; k++) if (this.hot[k] === id) this.hot[k] = null;
+    this.hot[i] = id;
+  }
+
+  /** Lo recién cogido va a la primera ranura libre si aún no está en la barra. */
+  autoSlot(id: string) {
+    if (this.hot.includes(id)) return;
+    // una ranura vacía o con algo que ya no se lleva (soltado, gastado): si la barra se llena de huecos muertos, lo nuevo no se vería
+    const own = this.own;
+    const free = this.hot.findIndex((h) => !h || !HOT[h]?.have(own));
+    if (free >= 0) this.hot[free] = id;
+  }
+
+  /** Beber una lata de Almond Water: vida y aguante llenos y media cordura. */
+  drink() {
+    if (this.water <= 0) return;
+    this.water--;
+    this.stamina = 1;
+    this.hp = HP_MAX;
+    this.winded = false;
+    this.sanity = Math.min(1, this.sanity + 0.5);
+    if (this.water <= 0) this.prop = 'none';
+    this.onDrink?.();
+  }
+
+  /** Sacar la lata de Almond Water (se bebe manteniendo; ver `drinkT`). */
+  equipWater() {
+    if (this.water <= 0) return;
+    this.hold('none');
+    this.gadget = 'none';
+    this.prop = 'water';
+  }
+
+  /** Lo que se lleva, para HOT. */
+  get own() {
+    return { water: this.water, totem: this.totem, radar: this.radar, camera: this.has.camera, gun: this.has.gun, caution: this.caution, watergun: this.poolGear.watergun };
+  }
+
+  /** Todo lo que lleva, como lo cuenta el servidor (el inventario que se conserva entre rondas). */
+  get inventory(): Inventory {
+    return { spares: this.spares, water: this.water, totem: this.totem, ammo: this.ammo + this.spare, radar: this.radar, camera: this.has.camera, gun: this.has.gun, caution: this.caution, ...this.poolGear };
+  }
+  /** Lo de las Poolrooms (traje de buzo, pistola de agua): aquí no se usa, pero se conserva para devolverlo al servidor. */
+  private poolGear = { tank: false, watergun: false };
+
+  /**
+   * Pone lo que lleva según `inv`: cantidades y qué tiene. Lo que ya no tiene sale de la mano, el cinturón y los gadgets; lo nuevo
+   * va a su sitio (mano o cinturón, barra rápida).
+   */
+  apply(inv: Inventory) {
+    const had = this.inventory;
+    this.poolGear = { tank: inv.tank, watergun: inv.watergun };
+    if (!inv.watergun && this.hand === 'watergun') this.hold('none');
+    this.spares = inv.spares;
+    this.water = inv.water;
+    this.totem = inv.totem;
+    this.radar = inv.radar;
+    this.caution = inv.caution;
+    this.has.camera = inv.camera;
+    this.has.gun = inv.gun;
+    const d = inv.ammo - had.ammo; // balas: lo que sobra va a la reserva; lo que falta sale primero de ella
+    if (d > 0) this.spare += d;
+    else {
+      const k = Math.min(this.spare, -d);
+      this.spare -= k;
+      this.ammo = Math.max(0, this.ammo - (-d - k));
+    }
+    for (const g of ['camera', 'gun'] as const)
+      if (!inv[g]) {
+        if (this.hand === g) this.hold('none');
+        if (this.belt === g) this.belt = 'none';
+      }
+    if (!inv.radar && this.gadget === 'radar') this.gadget = 'none';
+    if (!inv.caution && this.gadget === 'caution') this.gadget = 'none';
+    if (!inv.totem && this.gadget === 'totem') this.gadget = 'none';
+    for (const g of ['camera', 'gun'] as const) if (inv[g] && !had[g]) (this.stow(g), this.autoSlot(g));
+    for (const k of ['water', 'totem', 'radar', 'caution', 'watergun'] as const) if (inv[k] && !had[k]) this.autoSlot(k);
+  }
+
+  /** Empezar la ronda con este inventario (el del servidor): nada de lo anterior, el cargador lleno. */
+  load(inv: Inventory) {
+    this.hot.fill(null);
+    this.hand = this.belt = 'none';
+    this.gadget = 'none';
+    this.has.camera = this.has.gun = this.radar = this.caution = false;
+    this.spares = this.water = this.totem = this.ammo = this.spare = 0;
+    this.apply(inv);
+    const t = this.ammo + this.spare;
+    this.ammo = Math.min(AMMO_PACK, t);
+    this.spare = t - this.ammo;
+  }
+
+  /** ¿Lleva una unidad de `id` que soltar? */
+  owns(id: ItemId) {
+    return hasItem(this.inventory, id);
+  }
+  /** Una unidad menos de `id` (la soltó) o una más (la recogió del suelo). */
+  lose(id: ItemId) {
+    this.apply(removeItem(this.inventory, id));
+  }
+  receive(id: ItemId) {
+    this.apply(addItem(this.inventory, id));
+  }
+
+  /** Q: lo de la mano derecha al cinturón y lo del cinturón a la mano. */
   swap() {
+    if (this.hand === 'watergun') return;
     const b = this.belt;
     this.belt = this.hand;
     this.hold(b);
@@ -413,6 +815,7 @@ export class Player {
 
   /** Poner `it` en `slot` (o vaciarlo con 'none'): sale de donde estuviera; lo que había, al almacén. */
   place(slot: Slot, it: Gear | 'none') {
+    if (slot === 'left' && it === 'none') return false; // la linterna es de la mano secundaria y no se guarda
     if (it !== 'none') {
       if (!FITS[slot].includes(it) || (it !== 'flashlight' && !this.has[it])) return false;
       if (this.hand === it) this.hold('none');
@@ -433,6 +836,7 @@ export class Player {
 
   dispose() {
     for (const it of Object.values(this.items)) it.removeFromParent();
+    this.jet.pts?.removeFromParent();
     this.rig.root.removeFromParent();
     this.rig.mixer.stopAllAction();
   }

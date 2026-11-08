@@ -2,11 +2,12 @@ import * as THREE from 'three';
 import { GLTFLoader, type GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { EMOTE_GAP, WAIT_HALF, WAIT_SPAWNS } from '@backrooms/shared';
+import { EMOTE_GAP, INV_MAX, WAIT_HALF, WAIT_SPAWNS, canHold, shopItem, type Inventory } from '@backrooms/shared';
 import type { Assets } from './game';
 import type { Controls } from './input';
 import { Corridor } from './waitCorridor';
 import { Decor, TUBE_Z } from './waitDecor';
+import { addProps, type Extra } from './waitProps';
 import { canvasTex, clamp, hash, plane, smooth, type Box } from './waitKit';
 
 /*
@@ -46,7 +47,7 @@ const SHORT = { off1: 0.4, off2: 0.2, alarmA: 0, alarmB: 0, boom: 0.15, doorA: 0
 export interface WaitSfx {
   (name: 'click' | 'thunk' | 'creak' | 'boom' | 'alarm' | 'alarmoff' | 'vend'): void;
 }
-export type Hint = 'computer' | 'button' | 'vending' | 'chair' | 'lamp' | 'stand';
+export type Hint = 'computer' | 'board' | 'button' | 'vending' | 'chair' | 'lamp' | 'stand';
 
 export class WaitingRoom {
   readonly scene = new THREE.Scene();
@@ -63,11 +64,24 @@ export class WaitingRoom {
   /** Un aviso corto (p. ej. «SOLO EL PROPIETARIO») y hasta cuándo (age). */
   notice = '';
   private noticeUntil = 0;
-  mode: 'free' | 'computer' | 'starting' = 'free';
+  mode: 'free' | 'computer' | 'board' | 'starting' = 'free';
+  /** Qué vista toma la cámara al acercarse: la pantalla del ordenador o la pizarra. */
+  private view: 'pc' | 'board' = 'pc';
+  private boardPos = new THREE.Vector3(-1.73, 1.5, 0.97);
+  private boardQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(0, Math.PI, 0, 'YXZ'));
   private blend = 0; // 0 → 1: la cámara de pie → ante la pantalla
   private age = 0;
   onComputer?: (open: boolean) => void;
+  onBoard?: (open: boolean) => void;
   onPress?: () => void;
+  /** E sin nada a lo que apuntar: abre el inventario. */
+  onBag?: () => void;
+  /** Compra una lata en la máquina (el servidor cobra del dinero común y la pone en la mochila). */
+  onVend?: (done: (r: { ok: boolean; error?: string }) => void) => void;
+  /** Saldo común y mochila, para el precio y los avisos de la máquina. */
+  bank = 0;
+  inv: Inventory | null = null;
+  private vendBusy = false;
   sfx?: WaitSfx;
   // sentado (en el sillón o en el suelo) y emotes
   private seat: 'none' | 'chair' | 'floor' = 'none';
@@ -103,6 +117,7 @@ export class WaitingRoom {
   private compYaw = 0;
   private compPitch = 0;
   private decor!: Decor;
+  private props!: (age: number) => void;
   private corridor!: Corridor;
   private me!: THREE.Mesh; // mi sombra falsa
   // la entrada
@@ -120,11 +135,11 @@ export class WaitingRoom {
   static async load(assets: Assets, reduced: boolean) {
     const gl = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
     const get = (n: string) => gl.loadAsync(`/models/waiting/${n}.glb`).catch((e) => (console.warn('waiting model', n, e), undefined));
-    const [pc, btn] = await Promise.all([get('computer'), get('button')]);
-    return new WaitingRoom(assets, reduced, pc, btn);
+    const [pc, btn, chair, vend, wb] = await Promise.all([get('computer'), get('button'), get('chair50'), get('vending'), get('whiteboard')]);
+    return new WaitingRoom(assets, reduced, pc, btn, { chair }, vend, wb);
   }
 
-  private constructor(assets: Assets, private reduced: boolean, pc?: GLTF, btn?: GLTF) {
+  private constructor(assets: Assets, private reduced: boolean, pc?: GLTF, btn?: GLTF, extra: Extra = {}, vend?: GLTF, wb?: GLTF) {
     const S = this.scene;
     S.background = FOG0.clone();
     S.fog = new THREE.Fog(FOG0.getHex(), 6, 20);
@@ -285,7 +300,7 @@ export class WaitingRoom {
     add(sign);
 
     // el decorado (pósters, máquina, cables, manchas, polvo...)
-    this.decor = new Decor(S, bag, reduced);
+    this.decor = new Decor(S, bag, reduced, vend, assets.gltf.water, wb);
     this.boxes.push(...this.decor.boxes);
 
     // la mesa del ordenador (contra la pared oeste) y su ordenador
@@ -339,6 +354,9 @@ export class WaitingRoom {
       { kind: 'lamp', p: this.decor.lampAt.clone(), reach: 2.6 },
     );
 
+    // sillones, tele y ventana (waitProps.ts)
+    this.props = addProps(S, assets, extra, bag, this.boxes, (b) => this.decor.shadowUnder(b));
+
     // mi sombra falsa
     this.me = new THREE.Mesh(new THREE.PlaneGeometry(0.9, 0.9).rotateX(-Math.PI / 2), this.decor.blobMaterial);
     this.me.renderOrder = 1;
@@ -389,6 +407,8 @@ export class WaitingRoom {
     });
     sc = sc.clone();
     this.targets.push({ kind: 'computer', p: sc, reach: 2.3 });
+    // la pizarra (en la pared sur, ver waitDecor.ts): se mira desde 1,5 m, algo a su derecha (mirando a +z, la derecha es -x) para que la pizarra quede en la mitad izquierda de la pantalla de la pantalla
+    this.targets.push({ kind: 'board', p: new THREE.Vector3(-1.1, 1.5, H.z - 0.03), reach: 2.8 });
     // la vista: delante de la pantalla (mira a -x), a 0,34 m: el cristal llena casi todo el alto
     this.compPos.set(sc.x + 0.34, sc.y + 0.005, sc.z);
     this.compYaw = Math.PI / 2; // yaw = π/2 mira a -x
@@ -440,18 +460,39 @@ export class WaitingRoom {
 
   /** Lo que se manda a los demás (a 15 Hz): de pie donde estoy; ante el ordenador, mirándolo. */
   get state() {
-    const pc = this.mode === 'computer' || (this.mode === 'free' && this.blend > 0.5);
-    const anim = this.mode !== 'free' ? 'Neutral Idle' : this.speed > 2 ? 'Slow Run' : this.speed > 0 ? 'Walking222' : 'Neutral Idle';
-    const t = this.targets[0].p, yaw = pc ? Math.atan2(this.pos.x - t.x, this.pos.z - t.z) : this.yaw;
-    return { x: this.pos.x, y: 0, z: this.pos.z, yaw, pitch: pc ? 0 : this.pitch, anim, light: false, held: 'none' as const, emote: this.emote };
+    const pc = this.mode === 'computer' || this.mode === 'board' || (this.mode === 'free' && this.blend > 0.5);
+    const anim = 'Neutral Idle'; // (el campo se conserva en el protocolo; el cuerpo lo lleva el Animator por movimiento)
+    const t = this.targets[this.view === 'board' ? 1 : 0].p, yaw = pc ? Math.atan2(this.pos.x - t.x, this.pos.z - t.z) : this.yaw;
+    return { x: this.pos.x, y: this.py, z: this.pos.z, yaw, pitch: pc ? 0 : this.pitch, anim, light: this.lit, duck: this.duckK > 0.5, held: this.held, emote: this.emote };
+  }
+  /** Salto y agachado (el Player de la sala de espera lo copia), y lo que se lleva (linterna encendida, objeto en la mano: lo pone game.ts). */
+  py = 0;
+  private vy = 0;
+  duckK = 0;
+  lit = false;
+  held: 'none' | 'camera' | 'gun' = 'none';
+  /** De pie y libre (ni sentado, ni ante la pantalla, ni en la entrada): entonces se ven las manos y los objetos del Player. */
+  get driving() {
+    return this.mode === 'free' && this.blend === 0 && this.seat === 'none' && !this.seq;
+  }
+  /** ¿Choca un círculo de la sala en (x, z)? (la física del Player de la sala de espera). */
+  solid(x: number, z: number) {
+    return this.blocked(x, z);
+  }
+
+  private get vendLabel() {
+    const w = shopItem('water')!, inv = this.inv;
+    const why = inv && !canHold(inv, 'water') ? `MAX ${INV_MAX.water}` : this.bank < w.price ? 'NO FUNDS' : '';
+    return `ALMOND WATER $${w.price}${why ? ` · ${why}` : ''}`;
   }
 
   /** Lo que se lee en el aviso de «E» según a lo que se apunte. */
   get hintLabel() {
     switch (this.hint) {
       case 'computer': return 'COMPUTER';
+      case 'board': return 'LEVEL BOARD';
       case 'button': return this.owner ? 'PRESS THE BUTTON' : 'BUTTON';
-      case 'vending': return 'VENDING MACHINE';
+      case 'vending': return this.vendLabel;
       case 'chair': return 'SIT DOWN';
       case 'lamp': return this.decor.lampOn ? 'LAMP OFF' : 'LAMP ON';
       case 'stand': return 'STAND UP';
@@ -506,8 +547,9 @@ export class WaitingRoom {
     else this.free(dt, c);
     this.lights(dt);
     this.corridor.update(dt, this.seq?.t ?? 0, this.hinge.rotation.y / 1.75, !!this.seq, this.reduced);
+    this.props(this.age);
     this.decor.update(dt, this.age, this.p, this.pressed, this.seq && this.p[0] + this.p[1] < 0.2 ? 1 : 0);
-    this.me.visible = this.mode !== 'computer' && this.blend < 0.2 && this.seat !== 'chair';
+    this.me.visible = this.mode !== 'computer' && this.mode !== 'board' && this.blend < 0.2 && this.seat !== 'chair';
     this.me.position.set(this.pos.x, 0.01, this.pos.z);
     // el botón se hunde (0,12 s) y, si el servidor no lo acepta, vuelve a su sitio
     if (this.pressed && !this.seq && this.age - this.pressedAt > 1.3) this.pressed = false;
@@ -519,7 +561,7 @@ export class WaitingRoom {
   }
 
   private free(dt: number, c: Controls) {
-    const want = this.mode === 'computer' ? 1 : 0;
+    const want = this.mode === 'computer' || this.mode === 'board' ? 1 : 0;
     this.blend = clamp(this.blend + (want ? dt : -dt) / 0.7, 0, 1);
     if (this.mode === 'free' && this.blend === 0) {
       this.yaw -= c.look.x;
@@ -531,7 +573,14 @@ export class WaitingRoom {
         this.hint = 'stand';
         if (c.bag || (moving && this.seat === 'floor') || (c.move.length() > 0.4 && this.seat === 'chair')) this.standUp();
       } else {
-        const speed = moving ? (c.run ? RUN : WALK) * Math.min(1, c.move.length()) : 0;
+        // saltar y agacharse (como en las Backrooms: agachado se anda a la mitad y correr manda)
+        const duck = !!c.crouch && !c.run && this.py <= 0;
+        this.duckK += ((duck ? 1 : 0) - this.duckK) * Math.min(1, dt * 10);
+        if (c.jump && this.py <= 0 && !duck) (this.vy = Math.sqrt(2 * 9.8 * 0.9)), this.endEmote();
+        this.vy -= 9.8 * dt;
+        this.py = Math.max(0, this.py + this.vy * dt);
+        if (this.py === 0) this.vy = 0;
+        const speed = moving ? (c.run ? RUN : WALK) * Math.min(1, c.move.length()) * (duck ? 0.5 : 1) : 0;
         const f = new THREE.Vector3(-Math.sin(this.yaw), 0, -Math.cos(this.yaw)), r = new THREE.Vector3(-f.z, 0, f.x);
         const v = f.multiplyScalar(c.move.y).add(r.multiplyScalar(c.move.x));
         if (v.lengthSq() > 0) v.normalize().multiplyScalar(speed * dt);
@@ -542,21 +591,22 @@ export class WaitingRoom {
         // un emote se acaba solo, o al moverse
         if (this.emote && ((this.emoteUntil && this.age > this.emoteUntil) || speed > 0)) this.endEmote();
         this.look();
-        if (c.bag && this.hint) this.use(this.hint);
+        if (c.bag) (this.hint ? this.use(this.hint) : this.onBag?.());
       }
     } else {
       this.speed = 0;
       this.hint = null;
-      if (this.mode === 'computer' && c.bag) this.closeComputer();
+      if ((this.mode === 'computer' || this.mode === 'board') && c.bag) this.closeComputer();
     }
     // la cámara: de pie (con el paso), sentada o, ante el ordenador, la vista de la pantalla
     this.sit += ((this.seat === 'none' ? 0 : 1) - this.sit) * Math.min(1, dt * 7);
     const e = smooth(this.blend), cam = this.camera;
     const eye = EYE + (this.seat === 'chair' ? 1.1 - EYE : 0.85 - EYE) * this.sit;
-    const y = eye + (this.reduced ? 0 : Math.sin(this.bob) * 0.012 * Math.min(1, this.speed));
-    cam.position.set(this.pos.x, y, this.pos.z).lerp(this.compPos, e);
+    const y = eye + this.py - 0.6 * this.duckK + (this.reduced || this.py > 0 ? 0 : Math.sin(this.bob) * 0.012 * Math.min(1, this.speed));
+    const vp = this.view === 'board' ? this.boardPos : this.compPos, vq = this.view === 'board' ? this.boardQuat : this.compQuat;
+    cam.position.set(this.pos.x, y, this.pos.z).lerp(vp, e);
     _q.setFromEuler(_e.set(this.pitch, this.yaw, 0, 'YXZ'));
-    cam.quaternion.copy(_q).slerp(this.compQuat, e);
+    cam.quaternion.copy(_q).slerp(vq, e);
     // al sentarse o levantarse, la cámara viaja (no salta)
     if (this.hop) {
       this.hop.t += dt / 0.45;
@@ -579,9 +629,16 @@ export class WaitingRoom {
   }
 
   private use(what: Hint) {
-    if (what === 'computer') {
+    if (what === 'board') {
+      this.endEmote();
+      this.mode = 'board';
+      this.view = 'board';
+      this.hint = null;
+      this.onBoard?.(true);
+    } else if (what === 'computer') {
       this.endEmote();
       this.mode = 'computer';
+      this.view = 'pc';
       this.hint = null;
       this.onComputer?.(true);
     } else if (what === 'button') {
@@ -596,19 +653,36 @@ export class WaitingRoom {
       this.sitAt('chair');
       this.sfx?.('click');
     } else if (what === 'vending') {
-      if (this.decor.dispensing) return;
-      this.decor.dispense(this.age);
-      this.sfx?.('vend');
+      const w = shopItem('water')!;
+      if (this.decor.dispensing || this.vendBusy) return;
+      if (this.inv && !canHold(this.inv, 'water')) return this.say(`YOU CANNOT CARRY MORE WATER (${INV_MAX.water})`), this.sfx?.('click');
+      if (this.bank < w.price) return this.say(`NOT ENOUGH MONEY · $${w.price}`), this.sfx?.('click');
+      this.vendBusy = true;
+      this.onVend?.((r) => {
+        this.vendBusy = false;
+        if (!r.ok) return this.say((r.error ?? 'COULD NOT BUY').toUpperCase());
+        this.decor.dispense(this.age);
+        this.sfx?.('vend');
+        this.say(`BOUGHT ALMOND WATER · $${w.price}`);
+      });
+      setTimeout(() => (this.vendBusy = false), 2000);
     } else if (what === 'lamp') {
       this.decor.toggleLamp();
       this.sfx?.('click');
     }
   }
 
+  /** Cierra el ordenador o la pizarra, el que esté abierto. */
   closeComputer() {
-    if (this.mode !== 'computer') return;
+    if (this.mode !== 'computer' && this.mode !== 'board') return;
+    const was = this.mode;
     this.mode = 'free';
-    this.onComputer?.(false);
+    (was === 'board' ? this.onBoard : this.onComputer)?.(false);
+  }
+
+  /** El nivel al que lleva la puerta, en la pizarra de la pared. */
+  setBoard(round: number, levelId: string) {
+    this.decor.setBoard(round, levelId);
   }
 
   /** Un aviso corto sobre la escena. */
@@ -693,6 +767,7 @@ export class WaitingRoom {
   begin() {
     if (this.seq) return;
     if (this.mode === 'computer') this.onComputer?.(false);
+    if (this.mode === 'board') this.onBoard?.(false);
     if (this.seat !== 'none') this.standUp();
     this.emote = 0;
     this.mode = 'starting';

@@ -2,12 +2,16 @@ import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { Server } from 'socket.io';
 import {
-  SERVER_PORT, MAX_PLAYERS, DEFAULT_LOOK, cosmetic, lookAllowed, NAME_MAX, CHAT_MAX, CHAT_GAP, ROOM_NAME_MAX, DIFFICULTY, START_DELAY, WAIT_HALF, WAIT_SPAWNS, EMOTES, EMOTE_GAP,
-  type ClientToServer, type ServerToClient, type Status, type PlayerState, type Room, type RoomView, type RoomInfo, type Look,
+  SERVER_PORT, MAX_PLAYERS, DEFAULT_LOOK, cosmetic, lookAllowed, HP_MAX, NAME_MAX, CHAT_MAX, CHAT_GAP, ROOM_NAME_MAX, DIFFICULTY, START_DELAY, VOTE_TIME, LOAD_GRACE, WAIT_HALF, WAIT_SPAWNS, EMOTES, EMOTE_GAP, STRIP_MAX, STRIP_PTS, STRIP_GAP, REVIVE_IMMUNE, REVIVE_MIN,
+  START_BANK, START_INV, EMPTY_INV, INV_MAX, ASCENT_GRACE, DROP_MAX, DROP_TTL, DROP_GAP, offerMissions, poolMissions, pickLevel, tvCount, generateMaze, cleanInv, addItem, canHold, hasItem, removeItem, purchase, shopItem, penaltyOf, ITEM_IDS, LEVELS, centerOf,
+  type ItemId, type Inventory, type Mission, type MissionOffer, type RoundResult, type Fate, type Drop, type ActiveMission,
+  type AdminAction, type AdminInfo, type AdminReply, type ClientToServer, type ServerToClient, type Status, type PlayerState, type Room, type RoomView, type RoomInfo, type Look, type Strip,
 } from '@backrooms/shared';
 import { Match, type Player } from './match';
-import { allowedOrigins, handleApi, originOk, userFromCookie } from './auth';
-import { achievementsOf, loadoutOf } from './db';
+import { levelCaps, solidAt, startOffset } from '@backrooms/shared';
+import { allowedOrigins, handleApi, isAdminName, originOk, userFromCookie } from './auth';
+import { MONEY_LIMIT, parseAdmin } from './admin';
+import { achievementsOf, avatarRef, loadoutOf } from './db';
 import { award, count, hooks } from './progress';
 
 /*
@@ -42,15 +46,32 @@ const http = createServer((req, res) => {
 // with CLIENT_ORIGIN set (one or several, comma-separated), only those origins (production); without it, any origin (dev, LAN, port forwarding).
 // `credentials`: the session cookie travels with the socket (see auth.ts)
 // latido corto (por defecto 25 s + 20 s): si un túnel no pasa el cierre de la pestaña, el jugador fantasma desaparece en ≤ 13 s, no en 45
-const io = new Server<ClientToServer, ServerToClient>(http, { pingInterval: 5000, pingTimeout: 8000, cors: { origin: process.env.CLIENT_ORIGIN ? allowedOrigins : true, credentials: true } });
+const io = new Server<ClientToServer, ServerToClient>(http, { pingInterval: 10000, pingTimeout: 25000, cors: { origin: process.env.CLIENT_ORIGIN ? allowedOrigins : true, credentials: true } });
 
-interface RoomState extends Room {
+interface RoomState extends Omit<Room, 'caps' | 'offers' | 'leading' | 'mission' | 'ascent' | 'vote'> {
   players: Map<string, Player>;
   match?: Match;
   startedAt?: number;
   /** Jugadores al empezar la partida y cuántos han caído en ella (para los logros de equipo). */
   size0: number;
   deaths: number;
+  /** Cintas de acordonar puestas. */
+  strips: Strip[];
+  /** La ronda: semilla de la que viene (misiones y mapa), las 3 misiones de la pizarra, los votos (socket → id de misión), la elegida, si ya se cumplió y cuándo subió el primero. */
+  nextSeed: number;
+  pool: Mission[];
+  votes: Map<string, string>;
+  chosen?: Mission;
+  /** Fase `starting`: cuándo se cierra la votación (undefined hasta que acaba la entrada) y quiénes han avisado de que tienen el nivel cargado. */
+  voteEnd?: number;
+  loaded: Set<string>;
+  done: boolean;
+  boardAt?: number;
+  lastProgress: number;
+  /** Admin: la salida de la cuenta atrás de START_DELAY que vale (si se reinicia la ronda, la anterior no hace nada). */
+  tok?: number;
+  /** Objetos soltados en el suelo (con la hora a la que se soltaron, para el TTL). */
+  drops: Map<string, Drop & { at: number }>;
 }
 const rooms = new Map<string, RoomState>();
 const where = new Map<string, string>(); // socket → código de su sala
@@ -66,16 +87,32 @@ function newCode() {
 const cleanName = (n: unknown) => String(n ?? '').replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, NAME_MAX) || 'anon';
 const sockets = new Map<number, Set<string>>(); // cuenta → sus sockets conectados
 const guestColor = new Map<string, string>(); // socket de invitado → su color (uno gratis)
-const view = (r: RoomState): RoomView => ({
-  code: r.code, tape: r.tape, name: r.name, public: r.public, ownerId: r.ownerId, max: r.max, difficulty: r.difficulty, fixedSeed: r.fixedSeed, phase: r.phase, seed: r.seed,
-  players: [...r.players.values()].map((p) => ({ id: p.id, name: p.name, dead: p.dead, look: p.look })),
-});
+/** Las misiones de la pizarra con sus votos (solo los de quienes siguen en la sala) y la que va ganando (la más votada; sin votos, la primera). */
+function offers(r: RoomState): { offers: MissionOffer[]; leading: string } {
+  const out = r.pool.map((m) => ({ ...m, votes: [...r.votes].filter(([s, id]) => id === m.id && r.players.has(s)).map(([s]) => s) }));
+  const top = out.reduce((a, o) => (o.votes.length > a.votes.length ? o : a), out[0]);
+  return { offers: out, leading: top?.id ?? '' };
+}
+const active = (r: RoomState): ActiveMission | null => (r.chosen ? { ...r.chosen, progress: r.done ? r.chosen.goal : (r.match?.progress ?? 0), done: r.done } : null);
+const view = (r: RoomState): RoomView => {
+  const lobby = r.phase === 'lobby', boarded = [...r.players.values()].filter((p) => p.boarded).map((p) => p.id);
+  return {
+    code: r.code, tape: r.tape, name: r.name, public: r.public, ownerId: r.ownerId, max: r.max, difficulty: r.difficulty, fixedSeed: r.fixedSeed, pools: r.pools, phase: r.phase, seed: r.seed,
+    bank: r.bank, round: r.round, levelId: r.levelId, caps: levelCaps(r.levelId), ...(r.phase === 'starting' ? offers(r) : { offers: [], leading: '' }), mission: lobby ? null : active(r),
+    vote: r.phase === 'starting' && r.voteEnd ? { left: r.chosen ? 0 : Math.max(0, r.voteEnd - Date.now()), loaded: [...r.loaded].filter((s) => r.players.has(s)) } : null,
+    ascent: r.boardAt ? { left: Math.max(0, Math.round(ASCENT_GRACE - (Date.now() - r.boardAt) / 1000)), boarded } : null,
+    players: [...r.players.values()].map((p) => ({ id: p.id, name: p.name, dead: p.dead, look: p.look, avatar: avatarRef(p.uid), ready: !!p.ready, boarded: !!p.boarded })),
+  };
+};
 const push = (r: RoomState) => io.to(r.code).emit('room', view(r));
 const START: PlayerState = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, anim: 'Neutral Idle', light: true, held: 'none' };
 /** Dónde está de pie en la sala de espera quien ocupa el hueco `i` (sin linterna). */
 const waitSpot = (i: number): PlayerState => ({ ...START, ...WAIT_SPAWNS[i % WAIT_SPAWNS.length], light: false });
 /** Lo que se acepta en la sala de espera: dentro de la caja (menos lo que ocupa el cuerpo). */
 const WAIT_PAD = 0.25;
+const MAX_ROOMS = 200; // salas a la vez: un script no puede llenar la memoria creándolas
+const MAX_SPEED = 6.5, MOVE_SLACK = 2; // m/s y m: lo más que se deja avanzar en solitario (ver `state`)
+const moveAt = new Map<string, number>(); // cuándo llegó el último estado de cada jugador
 const emoteAt = new Map<string, number>(); // cuándo cambió cada jugador de emote por última vez
 const inWait = (r: RoomState) => r.phase === 'lobby' || r.phase === 'starting';
 
@@ -88,7 +125,7 @@ function lookFor(uid: number, id: string): Look {
   return { ...DEFAULT_LOOK, color: guestColor.get(id) ?? 'stock' };
 }
 function addPlayer(r: RoomState, id: string, name: string, uid: number) {
-  r.players.set(id, { id, name, st: waitSpot(r.players.size), dead: false, lastChat: 0, lastHit: 0, seen: false, uid, look: lookFor(uid, id) });
+  r.players.set(id, { id, name, st: waitSpot(r.players.size), dead: false, lastChat: 0, lastHit: 0, seen: false, uid, look: lookFor(uid, id), hp: HP_MAX, water: 0, totem: 0, inv: { ...START_INV }, cap: { ...START_INV } });
   where.set(id, r.code);
 }
 
@@ -96,48 +133,206 @@ function leave(id: string) {
   const code = where.get(id);
   where.delete(id);
   emoteAt.delete(id);
+  moveAt.delete(id);
   const r = code ? rooms.get(code) : undefined;
   if (!r) return;
   io.sockets.sockets.get(id)?.leave(code!);
   r.players.delete(id);
+  r.votes.delete(id);
+  r.loaded.delete(id);
+  for (const k of r.strips.filter((k) => k.owner === id)) io.to(code!).emit('unstrip', k.id);
+  r.strips = r.strips.filter((k) => k.owner !== id);
   if (!r.players.size) return void rooms.delete(code!);
   if (r.ownerId === id) r.ownerId = r.players.keys().next().value!; // el siguiente pasa a ser el propietario
   push(r);
   if (r.phase === 'playing') checkOver(r);
 }
 
-/** Si ya no queda nadie vivo, se acaba; la derrota se retrasa para que el último termine de caer. */
+/**
+ * La ronda se acaba cuando ya no queda nadie jugando (todos los vivos han subido al ascensor, o no queda ninguno vivo) o han pasado
+ * ASCENT_GRACE s desde que subió el primero.
+ */
 function checkOver(r: RoomState) {
-  if (r.phase !== 'playing' || [...r.players.values()].some((p) => !p.dead)) return;
-  finish(r, false);
+  if (r.phase !== 'playing') return;
+  const grace = !!r.boardAt && Date.now() - r.boardAt >= ASCENT_GRACE * 1000;
+  if (!grace && [...r.players.values()].some((p) => !p.dead && !p.boarded)) return;
+  finish(r);
 }
-function finish(r: RoomState, won: boolean) {
+
+/** Prepara la ronda que viene (en el lobby): su semilla, el nivel y las tres misiones de la pizarra, sin votos. */
+function prepare(r: RoomState, seed = 0, level?: string) {
+  r.nextSeed = seed || r.fixedSeed || 1 + ((Math.random() * 2 ** 31) | 0);
+  r.levelId = level ?? pickLevel(r.nextSeed, r.pools);
+  const pool = levelCaps(r.levelId).pool ? poolMissions(r.nextSeed, r.round) : offerMissions(r.nextSeed, r.round, tvCount(generateMaze(r.nextSeed))); // (el mapa dice cuántas televisiones hay)
+  r.pool = pool.map((m) => ({ ...m, reward: Math.round((m.reward * DIFFICULTY[r.difficulty].money) / 5) * 5 })); // la dificultad escala el dinero que da cada misión
+  r.votes.clear();
+}
+
+/** La sala vuelve al lobby (fin de ronda o admin): el propietario puede empezar otra. */
+function backToLobby(r: RoomState, ps: Player[]) {
+  // la sala vuelve al lobby: el propietario puede empezar otra
+  r.phase = 'lobby';
+  r.seed = 0;
+  r.match = undefined;
+  r.strips = [];
+  r.startedAt = undefined;
+  r.round++;
+  r.chosen = undefined;
+  r.done = false;
+  r.boardAt = undefined;
+  r.drops.clear();
+  prepare(r);
+  // de vuelta a la sala de espera: cada uno en su sitio
+  ps.forEach((p, i) => ((p.dead = false), (p.boarded = false), (p.seen = false), (p.hp = HP_MAX), (p.water = 0), (p.totem = 0), (p.reviving = p.immuneUntil = undefined), (p.ready = false), (p.st = waitSpot(i)), (p.cap = { ...p.inv })));
+  push(r);
+  for (const p of ps) io.to(p.id).emit('inv', p.inv);
+}
+
+/**
+ * Fin de la ronda: cobro o penalización, qué se conserva (solo quienes subieron vivos) y de vuelta al lobby. Si nadie subió, la derrota
+ * se retrasa 5 s para que el último termine de caer.
+ */
+function finish(r: RoomState) {
   if (r.phase !== 'playing') return;
   r.phase = 'over';
   const done = () => {
     if (rooms.get(r.code) !== r) return;
-    io.to(r.code).emit('over', { won });
-    // la sala vuelve al lobby: el propietario puede empezar otra
-    r.phase = 'lobby';
-    r.seed = 0;
-    r.match = undefined;
-    r.startedAt = undefined;
-    // de vuelta a la sala de espera: cada uno en su sitio
-    [...r.players.values()].forEach((p, i) => ((p.dead = false), (p.seen = false), (p.st = waitSpot(i))));
-    push(r);
+    const ps = [...r.players.values()], back = ps.filter((p) => p.boarded && !p.dead);
+    const won = r.done && back.length > 0;
+    const reward = won ? (r.chosen?.reward ?? 0) : 0, penalty = won ? 0 : penaltyOf(r.bank);
+    r.bank = Math.max(0, r.bank + reward - penalty);
+    const fates: Record<string, Fate> = {};
+    for (const p of ps) fates[p.id] = back.includes(p) ? 'back' : p.dead ? 'dead' : 'stranded';
+    if (won) creditEscape(r);
+    for (const p of ps) if (fates[p.id] !== 'back') p.inv = { ...EMPTY_INV }; // lo que llevaban se pierde
+    const result: RoundResult = { won, completed: r.done, mission: r.chosen ?? null, reward, penalty, bank: r.bank, fates };
+    io.to(r.code).emit('over', result);
+    backToLobby(r, ps);
   };
-  if (won) done();
+  if ([...r.players.values()].some((p) => p.boarded)) done();
   else setTimeout(done, 5000);
+}
+
+/** Lo que se gana al recoger algo del mapa (por la primera letra de su id): sube lo que puede llevar. */
+const GAIN: Record<string, ItemId> = { f: 'flashlight', w: 'water', m: 'totem', r: 'radar', c: 'camera', g: 'gun', k: 'tank', p: 'watergun' };
+function gain(p: Player, id: string) {
+  const k = GAIN[id[0]];
+  if (!k) return;
+  p.cap = addItem(p.cap, k);
+  if (k === 'gun') p.cap.ammo += 6; // el rifle del mapa trae dos cargadores
+}
+/** Recoger un objeto soltado: cerca de donde está y si cabe; el primero se lo lleva. */
+function takeDrop(r: RoomState, p: Player, id: string) {
+  const d = r.drops.get(id);
+  if (!d || p.dead || Math.hypot(p.st.x - d.x, p.st.z - d.z) > 3.6 || !canHold(p.cap, d.kind)) return false;
+  r.drops.delete(id);
+  p.cap = addItem(p.cap, d.kind);
+  return true;
+}
+let dropNo = 0;
+
+/** Cada tick de la partida: progreso de la misión (al cumplirse se abre el ascensor) y caducidad de lo soltado. Avisa a la sala si algo cambia. */
+function roundTick(r: RoomState) {
+  const m = r.match!, now = Date.now();
+  let changed = false;
+  if (r.chosen) {
+    const v = m.progress;
+    if (!r.done && v >= r.chosen.goal) (r.done = true), (changed = true);
+    if (v !== r.lastProgress) (r.lastProgress = v), (changed = true);
+  }
+  for (const [id, d] of r.drops) if (now - d.at > DROP_TTL * 1000) r.drops.delete(id);
+  if (changed) push(r);
 }
 
 /** Quienes siguen vivos al salir por el ascensor: contadores y logros de su cuenta. Los invitados no acumulan nada. */
 function creditEscape(r: RoomState) {
   for (const p of r.players.values()) {
-    if (!p.uid || p.dead) continue;
+    if (!p.uid || p.dead || !p.boarded) continue;
     count(p.uid, 'escapes');
     if (r.size0 >= 3) award(p.uid, 'team_player');
     if (!r.deaths) award(p.uid, 'survivor');
   }
+}
+
+/**
+ * Empieza la ronda desde el lobby. Fase `starting`: primero la entrada por la puerta (START_DELAY ms, sin misión) y, al acabar, la votación de la
+ * misión (VOTE_TIME ms o hasta que voten todos) mientras cada cliente carga el nivel y avisa con `ready`. La partida empieza cuando la votación
+ * está cerrada y todos han cargado (o pasan LOAD_GRACE ms).
+ */
+function begin(r: RoomState) {
+  r.seed = r.nextSeed;
+  r.chosen = undefined;
+  r.voteEnd = undefined;
+  r.votes.clear();
+  r.loaded.clear();
+  r.done = false;
+  r.boardAt = undefined;
+  r.lastProgress = -1;
+  for (const d of r.drops.values()) {
+    const o = r.players.get(d.by); // lo soltado en la sala de espera vuelve a quien lo soltó (si cabe)
+    if (o && canHold(o.inv, d.kind)) o.inv = addItem(o.inv, d.kind);
+  }
+  r.drops.clear();
+  // lo que cada uno lleva a la ronda: su inventario (la tienda y lo conservado)
+  for (const p of r.players.values()) (p.boarded = false), (p.cap = { ...p.inv }), io.to(p.id).emit('inv', p.inv);
+  r.phase = 'starting';
+  push(r);
+  const tok = (r.tok = (r.tok ?? 0) + 1);
+  const live = () => rooms.get(r.code) === r && r.phase === 'starting' && r.tok === tok;
+  setTimeout(() => {
+    if (!live()) return;
+    r.voteEnd = Date.now() + VOTE_TIME;
+    push(r);
+    let fast = false;
+    const iv = setInterval(() => {
+      if (!live()) return clearInterval(iv);
+      const now = Date.now(), ids = [...r.players.keys()];
+      if (!r.chosen) {
+        // todos han votado: la cuenta atrás se acorta para que se vea el resultado
+        if (!fast && ids.every((id) => r.votes.has(id))) (fast = true), (r.voteEnd = Math.min(r.voteEnd!, now + 1500)), push(r);
+        if (now >= r.voteEnd!) (r.chosen = closeVote(r)), push(r);
+      } else if (ids.every((id) => r.loaded.has(id)) || now >= r.voteEnd! + LOAD_GRACE) (clearInterval(iv), play(r));
+    }, 200);
+  }, START_DELAY);
+}
+
+/** La misión más votada (empate: al azar entre las empatadas; sin votos, la primera de la pizarra). */
+function closeVote(r: RoomState): Mission {
+  const o = offers(r).offers, top = Math.max(...o.map((m) => m.votes.length)), tied = o.filter((m) => m.votes.length === top);
+  const { votes: _v, ...pick } = top > 0 ? tied[(Math.random() * tied.length) | 0] : o[0];
+  return pick;
+}
+
+/** Votación cerrada y nivel cargado: empieza la partida. */
+function play(r: RoomState) {
+  r.match = new Match(r.seed, r.difficulty, r.players.size, r.levelId);
+  r.match.setMission(r.chosen!);
+  r.match.onHeld = (p) => p.uid && (count(p.uid, 'holds'), award(p.uid, 'held_breath'));
+  r.strips = [];
+  r.size0 = r.players.size;
+  r.deaths = 0;
+  for (const p of r.players.values()) (p.shot = new Set()), p.uid && count(p.uid, 'games');
+  r.phase = 'playing';
+  r.startedAt = Date.now();
+  let slot = 0;
+  for (const p of r.players.values()) {
+    const [ox, oz] = startOffset(slot++);
+    (p.dead = false), (p.seen = false), (p.hp = HP_MAX), (p.water = 0), (p.totem = 0), (p.reviving = p.immuneUntil = undefined), (p.st = { ...START, x: r.match.start.x + ox, z: r.match.start.z + oz });
+  }
+  push(r);
+}
+
+/** Un caído vuelve a la partida junto a `at` (a 0,7 m por el primer lado libre; si no, encima), con la vida llena e inmune un rato. */
+function revive(r: RoomState, p: Player, at: PlayerState) {
+  const m = r.match!.maze, o = [[0.7, 0], [-0.7, 0], [0, 0.7], [0, -0.7]].find(([dx, dz]) => !solidAt(m, at.x + dx, at.z + dz)) ?? [0, 0];
+  p.dead = false;
+  p.hp = HP_MAX;
+  p.seen = false;
+  p.reviving = undefined;
+  p.immuneUntil = Date.now() + REVIVE_IMMUNE;
+  p.st = { ...START, x: at.x + o[0], y: 0, z: at.z + o[1], yaw: at.yaw };
+  io.to(r.code).emit('revived', { id: p.id, name: p.name, x: p.st.x, y: 0, z: p.st.z, yaw: p.st.yaw });
+  push(r);
 }
 
 const roomOf = (id: string) => rooms.get(where.get(id) ?? '');
@@ -153,14 +348,17 @@ io.on('connection', (sock) => {
     addPlayer(r, sock.id, acct ? acct.user.username : name, uid);
     sock.join(r.code);
     cb({ id: sock.id, room: view(r) });
+    sock.emit('inv', r.players.get(sock.id)!.inv);
     push(r);
   };
 
   sock.on('create', (a, cb) => {
     if (typeof cb !== 'function') return;
     if (status.maintenance) return cb({ error: 'Maintenance' });
+    if (rooms.size >= MAX_ROOMS) return cb({ error: 'Server full' });
     leave(sock.id);
-    const r: RoomState = { code: newCode(), tape: ++tapeNo, name: `SALA ${tapeNo}`, public: !!a?.public, ownerId: sock.id, max: MAX_PLAYERS, difficulty: 'normal', fixedSeed: 0, phase: 'lobby', seed: 0, players: new Map(), size0: 0, deaths: 0 };
+    const r: RoomState = { code: newCode(), tape: ++tapeNo, name: `SALA ${tapeNo}`, public: !!a?.public, ownerId: sock.id, max: MAX_PLAYERS, difficulty: a?.difficulty && a.difficulty in DIFFICULTY ? a.difficulty : 'normal', fixedSeed: 0, pools: false, phase: 'lobby', seed: 0, players: new Map(), size0: 0, deaths: 0, strips: [], bank: START_BANK, round: 1, levelId: 'level0', nextSeed: 0, pool: [], votes: new Map(), loaded: new Set(), done: false, lastProgress: -1, drops: new Map() };
+    prepare(r);
     rooms.set(r.code, r);
     join(r, cleanName(a?.name), cb);
   });
@@ -196,39 +394,42 @@ io.on('connection', (sock) => {
     if (typeof a.name === 'string') r.name = a.name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, ROOM_NAME_MAX) || r.name;
     if (typeof a.public === 'boolean') r.public = a.public;
     if (Number.isFinite(a.max)) r.max = Math.min(MAX_PLAYERS, Math.max(2, r.players.size, Math.round(a.max!)));
-    if (a.difficulty && a.difficulty in DIFFICULTY) r.difficulty = a.difficulty;
-    if (Number.isFinite(a.fixedSeed)) r.fixedSeed = Math.min(2 ** 31 - 1, Math.max(0, Math.floor(a.fixedSeed!)));
+    if (a.difficulty && a.difficulty in DIFFICULTY && a.difficulty !== r.difficulty) (r.difficulty = a.difficulty), prepare(r, r.nextSeed, r.levelId); // mismas semilla y nivel: solo cambia lo que da cada misión
+    if (typeof a.pools === 'boolean' && a.pools !== r.pools) (r.pools = a.pools), prepare(r); // otro sorteo de niveles (apagado: vuelve al nivel 0)
+    if (Number.isFinite(a.fixedSeed)) {
+      const f = Math.min(2 ** 31 - 1, Math.max(0, Math.floor(a.fixedSeed!)));
+      if (f !== r.fixedSeed) (r.fixedSeed = f), prepare(r); // otra semilla: otro mapa y otras misiones
+    }
+    push(r);
+  });
+
+  sock.on('ready', (on) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    if (!r || !p) return;
+    if (r.phase === 'starting') {
+      // durante la votación: este cliente ya tiene el nivel cargado
+      if (on) (r.loaded.add(sock.id), push(r));
+      return;
+    }
+    if (r.phase !== 'lobby') return;
+    p.ready = !!on;
     push(r);
   });
 
   sock.on('start', () => {
     const r = roomOf(sock.id);
     if (!r || r.ownerId !== sock.id || r.phase !== 'lobby') return;
-    r.seed = r.fixedSeed || 1 + ((Math.random() * 2 ** 31) | 0);
-    // la puerta se abre: START_DELAY ms en los que nadie entra ni cambia nada, y luego empieza la partida
-    r.phase = 'starting';
-    push(r);
-    setTimeout(() => {
-      if (rooms.get(r.code) !== r || r.phase !== 'starting') return;
-      r.match = new Match(r.seed, r.difficulty, r.players.size);
-      r.match.onHeld = (p) => p.uid && (count(p.uid, 'holds'), award(p.uid, 'held_breath'));
-      r.size0 = r.players.size;
-      r.deaths = 0;
-      for (const p of r.players.values()) (p.shot = new Set()), p.uid && count(p.uid, 'games');
-      r.phase = 'playing';
-      r.startedAt = Date.now();
-      for (const p of r.players.values()) (p.dead = false), (p.seen = false), (p.st = { ...START, x: r.match.start.x, z: r.match.start.z });
-      push(r);
-    }, START_DELAY);
+    begin(r);
   });
 
   sock.on('state', (s) => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id);
-    if (!r || !p || !s || (r.phase !== 'playing' && !inWait(r)) || (r.phase === 'playing' && p.dead)) return;
+    if (!r || !p || !s || (r.phase !== 'playing' && !inWait(r)) || (r.phase === 'playing' && (p.dead || p.boarded))) return;
     const n = (v: unknown) => (Number.isFinite(v) ? (v as number) : 0);
     const st: PlayerState = {
       x: n(s.x), y: n(s.y), z: n(s.z), yaw: n(s.yaw), pitch: n(s.pitch),
       anim: String(s.anim ?? '').slice(0, 40), light: !!s.light, held: s.held === 'camera' || s.held === 'gun' ? s.held : 'none',
+      duck: !!s.duck, tank: !!s.tank, dance: /^\w{1,24}$/.test(String(s.dance)) ? String(s.dance) : undefined, variant: /^\w{1,24}$/.test(String(s.variant)) ? String(s.variant) : undefined, jam: Math.max(0, Math.min(20000, n(s.jam))),
       hiding: !!s.hiding, holding: !!s.holding, // el escondite lo valida Match (ver hiding)
       t: n(s.t), // el reloj del emisor: se reenvía tal cual para que los demás reconstruyan su ritmo
     };
@@ -243,6 +444,15 @@ io.on('connection', (sock) => {
       p.st = st;
       return;
     }
+    // velocidad: el cliente manda su posición, así que se limita lo que puede avanzar entre mensajes (correr son 3,6 m/s; margen para el retraso).
+    // Quien pasa de ahí (teletransporte, velocidad x2 desde la consola) se queda a lo máximo alcanzable. El admin queda fuera: tiene sus trucos de velocidad y tp.
+    const now2 = Date.now(), prev = moveAt.get(sock.id) ?? now2;
+    moveAt.set(sock.id, now2);
+    // un salto de `jam` al alza es un túnel sin fondo (teletransporte legítimo): no se recorta
+    if (!isAdmin() && !((st.jam ?? 0) > (p.st.jam ?? 0))) {
+      const reach = Math.min(2, (now2 - prev) / 1000) * MAX_SPEED + MOVE_SLACK, dx = st.x - p.st.x, dz = st.z - p.st.z, d = Math.hypot(dx, dz);
+      if (d > reach) (st.x = p.st.x + (dx / d) * reach), (st.z = p.st.z + (dz / d) * reach);
+    }
     if (st.hiding && !r.match?.hideOk(p, st)) st.hiding = st.holding = false; // solo en un nicho libre
     p.st = st;
     p.seen = true;
@@ -250,11 +460,203 @@ io.on('connection', (sock) => {
 
   sock.on('ping', (cb) => typeof cb === 'function' && cb());
 
+  // ── consola de admin ──────────────────────────────────────────────────────
+  // La autorización se decide AQUÍ, en cada llamada: la cuenta del socket (la de la cookie de sesión al conectar) tiene que seguir teniendo una sesión
+  // válida y llamarse exactamente ADMIN_USER. Un invitado (uid 0) o cualquier otra cuenta se rechaza sin ejecutar nada. El cliente solo muestra la consola.
+  const isAdmin = () => {
+    if (!acct || !uid) return false;
+    const s = userFromCookie(hs.cookie);
+    return !!s && s.user.id === uid && isAdminName(s.user.username);
+  };
+  sock.on('admin', (raw, cb) => {
+    const reply = (x: AdminReply) => typeof cb === 'function' && cb(x);
+    if (!isAdmin()) {
+      console.warn(`[admin] DENIED socket=${sock.id} uid=${uid}`);
+      return reply({ ok: false, error: 'FORBIDDEN' });
+    }
+    const a = parseAdmin(raw);
+    if (!a) return reply({ ok: false, error: 'BAD ACTION' });
+    const r = roomOf(sock.id);
+    console.log(`[admin] ${acct!.user.username} room=${r?.code ?? '-'} ${JSON.stringify(a)}`);
+    if (!r) return reply({ ok: false, error: 'NOT IN A ROOM' });
+    const me = r.players.get(sock.id)!, m = r.match;
+    const who = (t: string): Player[] => (t === 'all' ? [...r.players.values()] : [r.players.get(t === 'me' ? sock.id : t)].filter((p): p is Player => !!p));
+    const targets = 't' in a ? who(a.t) : [];
+    if ('t' in a && !targets.length) return reply({ ok: false, error: 'NO SUCH PLAYER' });
+    const playing = r.phase === 'playing' && !!m;
+    const need = (ok: boolean) => (ok ? true : (reply({ ok: false, error: 'ONLY DURING A ROUND' }), false));
+    const kill = (p: Player) => {
+      if (p.dead || p.boarded) return;
+      p.hp = 0;
+      p.dead = true;
+      r.deaths++;
+      io.to(r.code).emit('dead', p.id);
+    };
+    switch (a.a) {
+      case 'info': {
+        const info: AdminInfo = {
+          seed: r.seed || r.nextSeed, levelId: r.levelId, round: r.round, phase: r.phase, elapsed: Math.round(m?.elapsed ?? 0), bank: r.bank, mission: r.chosen ? `${r.chosen.text} ${m?.progress ?? 0}/${r.chosen.goal}${r.done ? ' DONE' : ''}` : '-',
+          ents: m?.entCount ?? 0, frozen: !!m?.frozen,
+          players: [...r.players.values()].map((p) => ({ id: p.id, name: p.name, hp: p.hp, dead: p.dead, god: (p.immuneUntil ?? 0) > Date.now() + 3600_000, ammo: !!p.infAmmo })),
+        };
+        return reply({ ok: true, info });
+      }
+      case 'level': {
+        if (!(a.id in LEVELS)) return reply({ ok: false, error: 'NO SUCH LEVEL' });
+        // una ronda de prueba para todos con ese nivel y esa semilla: si hay una en marcha se corta (todos vuelven a la sala de espera) y empieza otra
+        const go = () => {
+          if (rooms.get(r.code) !== r || r.phase !== 'lobby') return;
+          prepare(r, a.seed, a.id);
+          begin(r);
+        };
+        if (r.phase === 'lobby') go();
+        else if (r.phase === 'playing' || r.phase === 'starting') (r.tok = (r.tok ?? 0) + 1), backToLobby(r, [...r.players.values()]), setTimeout(go, 3500);
+        else return reply({ ok: false, error: 'ROUND ENDING' });
+        return reply({ ok: true });
+      }
+      case 'lobby':
+        if (r.phase === 'playing' || r.phase === 'starting') (r.tok = (r.tok ?? 0) + 1), backToLobby(r, [...r.players.values()]);
+        return reply({ ok: true });
+      case 'money':
+        r.bank = Math.min(MONEY_LIMIT, Math.max(0, a.mode === 'set' ? a.n : r.bank + a.n));
+        push(r);
+        return reply({ ok: true });
+      case 'give':
+        for (const p of targets) {
+          if (r.phase === 'lobby') {
+            if (!canHold(p.inv, a.item)) continue;
+            p.inv = purchase(p.inv, a.item);
+            io.to(p.id).emit('inv', p.inv);
+          } else if (playing && !p.dead && !p.boarded && canHold(p.cap, a.item)) {
+            p.cap = purchase(p.cap, a.item); // lo que puede llevar (y declarar al subir); el cliente lo recibe en la mano
+            io.to(p.id).emit('adminFx', { k: 'give', item: a.item });
+          }
+        }
+        return reply({ ok: true });
+      case 'god':
+        if (!need(playing)) return;
+        for (const p of targets) p.immuneUntil = a.on ? Number.MAX_SAFE_INTEGER : 0;
+        return reply({ ok: true });
+      case 'ammo':
+        for (const p of targets) (p.infAmmo = a.on), io.to(p.id).emit('adminFx', { k: 'ammo', on: a.on });
+        return reply({ ok: true });
+      case 'heal':
+        if (!need(playing)) return;
+        for (const p of targets) if (!p.dead) (p.hp = HP_MAX), io.to(p.id).emit('adminFx', { k: 'heal' });
+        return reply({ ok: true });
+      case 'kill':
+        if (!need(playing)) return;
+        targets.forEach(kill);
+        push(r);
+        checkOver(r);
+        return reply({ ok: true });
+      case 'revive': {
+        if (!need(playing)) return;
+        for (const p of targets) {
+          if (!p.dead || p.boarded) continue;
+          const at = [...r.players.values()].find((q) => q !== p && !q.dead && !q.boarded)?.st ?? { ...START, x: m!.start.x, z: m!.start.z };
+          revive(r, p, at);
+        }
+        return reply({ ok: true });
+      }
+      case 'run': {
+        // «Run for your life» a quien sea (lo corre su cliente por el flujo del Tótem): se le mata, empieza el nivel y al llegar el servidor lo revive (sin esperar REVIVE_MIN)
+        if (!need(playing)) return;
+        for (const p of targets) {
+          if (p.boarded) continue;
+          kill(p);
+          p.reviving = { by: sock.id, at: Date.now() - REVIVE_MIN };
+          io.to(r.code).emit('reviving', { id: p.id, name: p.name, by: sock.id });
+        }
+        push(r);
+        return reply({ ok: true });
+      }
+      case 'tp': {
+        if (!need(playing)) return;
+        const dest = a.to === 'elevator' ? centerOf(m!.maze.elevator) : a.to === 'start' ? m!.start : r.players.get(a.who === 'me' ? sock.id : (a.who ?? ''))?.st;
+        if (!dest) return reply({ ok: false, error: 'NO SUCH PLAYER' });
+        for (const p of targets) {
+          if (p.dead || p.boarded || p.st === dest) continue;
+          io.to(p.id).emit('adminFx', { k: 'tp', x: dest.x, y: 0, z: dest.z, yaw: p.st.yaw });
+        }
+        return reply({ ok: true });
+      }
+      case 'mission':
+        if (!need(playing && !!r.chosen)) return;
+        r.done = true;
+        push(r);
+        return reply({ ok: true });
+      case 'end': {
+        if (!need(playing)) return;
+        for (const p of r.players.values()) p.boarded = a.ok && !p.dead;
+        r.done = a.ok && [...r.players.values()].some((p) => p.boarded); // sin nadie vivo a quien subir, es un fracaso
+        finish(r);
+        return reply({ ok: true });
+      }
+      case 'tvs':
+        if (!need(playing)) return;
+        m!.allTvsOff();
+        return reply({ ok: true });
+      case 'ent': {
+        if (!need(playing)) return;
+        if (a.op === 'clear') m!.clearEnts();
+        else if (a.op === 'freeze' || a.op === 'thaw') m!.frozen = a.op === 'freeze';
+        else {
+          const at = r.players.get(a.near === 'me' || !a.near ? sock.id : a.near)?.st ?? me.st;
+          m!.adminSpawn(a.kind ?? (Math.random() < 0.5 ? 'bacteria' : 'partygoer'), at.x, at.z);
+        }
+        return reply({ ok: true });
+      }
+    }
+  });
+
   sock.on('pickup', (id, cb) => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id);
-    const ok = !!r?.match && !!p && r.phase === 'playing' && r.match.pickup(p, String(id));
-    if (ok && p!.uid && String(id)[0] === 't') count(p!.uid, 'tapes'); // las cintas (ids t...)
+    const k = String(id);
+    const kind = GAIN[k[0]];
+    // (ids d...: soltados) Lo del mapa que no cabe (ya lo lleva, o el tope) se deja donde está: si no, se perdería para todos sin llegar a nadie
+    // (en la sala de espera solo hay soltados `d…`: se recogen para el inventario que se conserva)
+    if (r?.phase === 'lobby' && p && k[0] === 'd') {
+      const d = r.drops.get(k);
+      const got = !!d && Math.hypot(p.st.x - d.x, p.st.z - d.z) < 3.6 && canHold(p.inv, d.kind);
+      if (got) (r.drops.delete(k), (p.inv = addItem(p.inv, d!.kind)), sock.emit('inv', p.inv));
+      if (typeof cb === 'function') cb(got);
+      return;
+    }
+    const ok = !!r?.match && !!p && r.phase === 'playing' && !p.boarded && (k[0] === 'd' ? takeDrop(r, p, k) : (!kind || canHold(p.cap, kind)) && r.match.pickup(p, k));
+    if (ok && p!.uid && k[0] === 't') count(p!.uid, 'tapes'); // las cintas (ids t...)
+    if (ok && k[0] !== 'd') gain(p!, k); // lo que se lleva: hay que tenerlo para soltarlo, beberlo o declararlo al subir
     if (typeof cb === 'function') cb(ok);
+  });
+
+  sock.on('strip', (pts) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    if (!r || !p || p.dead || r.phase !== 'playing' || !Array.isArray(pts)) return;
+    // puntos válidos, a más de STRIP_GAP*0,75 del anterior, hasta STRIP_PTS
+    const out: number[] = [];
+    for (let i = 0; i + 1 < pts.length && out.length < STRIP_PTS * 2; i += 2) {
+      const x = pts[i], z = pts[i + 1];
+      if (!Number.isFinite(x) || !Number.isFinite(z) || Math.abs(x) > 1e4 || Math.abs(z) > 1e4) return;
+      const n = out.length;
+      if (n && Math.hypot(x - out[n - 2], z - out[n - 1]) < STRIP_GAP * 0.75) continue;
+      out.push(x, z);
+    }
+    if (out.length < 4) return;
+    const mine = r.strips.filter((k) => k.owner === sock.id);
+    if (mine.length >= STRIP_MAX) {
+      r.strips.splice(r.strips.indexOf(mine[0]), 1);
+      io.to(r.code).emit('unstrip', mine[0].id);
+    }
+    const k: Strip = { id: Math.random().toString(36).slice(2, 8), owner: sock.id, pts: out };
+    r.strips.push(k);
+    io.to(r.code).emit('strip', k);
+  });
+
+  sock.on('unstrip', (id) => {
+    const r = roomOf(sock.id);
+    if (!r || r.phase !== 'playing' || !r.strips.some((k) => k.id === id)) return;
+    r.strips = r.strips.filter((k) => k.id !== id);
+    io.to(r.code).emit('unstrip', id);
   });
 
   sock.on('hit', (id) => {
@@ -266,9 +668,24 @@ io.on('connection', (sock) => {
     if (r.match.hit(p, Number(id)) && p.uid) (award(p.uid, 'idiot'), count(p.uid, 'kills'));
   });
 
+  // fuego amigo: un tiro del rifle que da a un compañero lo mata (el cliente apunta; aquí se comprueba rifle en mano, distancia y ritmo)
+  sock.on('shoot', (id) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id), q = r?.players.get(String(id));
+    if (!r?.match || !p || !q || q === p || r.phase !== 'playing' || p.dead || p.boarded || q.dead || q.boarded || p.st.held !== 'gun' || (q.immuneUntil ?? 0) > Date.now()) return;
+    if (Date.now() - p.lastHit < 200 || Math.hypot(p.st.x - q.st.x, p.st.z - q.st.z) > 35) return;
+    p.lastHit = Date.now();
+    q.hp = 0;
+    q.dead = true;
+    r.deaths++;
+    io.to(r.code).emit('dead', q.id);
+    push(r);
+    checkOver(r);
+  });
+
   sock.on('photo', () => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id);
-    if (r?.match && p && r.phase === 'playing' && p.uid && r.match.photo(p) !== undefined) count(p.uid, 'photos');
+    // la foto vale para la misión (de cualquiera, también invitados); el contador de la cuenta solo cuenta las de quien tiene cuenta
+    if (r?.match && p && r.phase === 'playing' && !p.boarded && r.match.photo(p) !== undefined && p.uid) count(p.uid, 'photos');
   });
 
   // invitados: su color, uno de los gratis (con cuenta el aspecto sale de la cuenta, no del cliente)
@@ -283,8 +700,8 @@ io.on('connection', (sock) => {
 
   sock.on('fell', () => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id);
-    if (!r?.match || !p || r.phase !== 'playing' || !r.match.fell(p)) return;
-    p.dead = true;
+    if (!r?.match || !p || r.phase !== 'playing' || p.boarded || !levelCaps(r.levelId).fall || !r.match.fell(p)) return; // (en las Poolrooms no hay vacío: las alturas negativas son agua)
+    p.dead = true; // (fell ya le dejó la vida a cero)
     r.deaths++;
     if (p.uid) count(p.uid, 'falls');
     io.to(r.code).emit('dead', p.id);
@@ -292,9 +709,135 @@ io.on('connection', (sock) => {
     checkOver(r);
   });
 
-  sock.on('exit', () => {
+  // el Tótem de la vida: lo usa un vivo que lo lleva con un compañero muerto, que pasa a correr «Run for your life» (lo simula su cliente)
+  sock.on('totem', (target, cb) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id), t = r?.players.get(String(target));
+    const ok = !!r?.match && r.phase === 'playing' && !!p && !!t && t !== p && !p.dead && p.cap.totem > 0 && t.dead && !t.reviving;
+    if (ok) {
+      p!.cap.totem--;
+      t!.reviving = { by: p!.id, at: Date.now() };
+      io.to(r!.code).emit('reviving', { id: t!.id, name: t!.name, by: p!.id });
+    }
+    if (typeof cb === 'function') cb(ok);
+  });
+
+  // el caído llega a la meta: solo vale una vez y pasado el tiempo mínimo; vuelve con la vida llena, inmune y junto a quien usó el Tótem
+  sock.on('runDone', () => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id);
-    if (r?.match && p && r.phase === 'playing' && r.match.canExit(p)) (creditEscape(r), finish(r, true));
+    if (!r?.match || !p || r.phase !== 'playing' || !p.dead || !p.reviving || Date.now() - p.reviving.at < REVIVE_MIN) return;
+    const by = r.players.get(p.reviving.by), at = by && !by.dead ? by : [...r.players.values()].find((q) => q !== p && !q.dead);
+    p.reviving = undefined;
+    if (!at) return;
+    revive(r, p, at.st);
+  });
+
+  // el caído no llega a la meta: solo hay una oportunidad, sigue muerto
+  sock.on('runFail', () => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    if (!r?.match || !p || r.phase !== 'playing' || !p.dead || !p.reviving) return;
+    p.reviving = undefined;
+    io.to(r.code).emit('runFailed', { id: p.id, name: p.name });
+    push(r);
+  });
+
+  // la cordura a cero: muere (como al caer). Vale mientras esté vivo y en partida
+  sock.on('insane', () => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    if (!r?.match || !p || r.phase !== 'playing' || p.boarded || p.dead || !levelCaps(r.levelId).insane) return; // (la cordura es del nivel 0)
+    p.hp = 0;
+    p.dead = true;
+    r.deaths++;
+    io.to(r.code).emit('dead', p.id);
+    push(r);
+    checkOver(r);
+  });
+
+  // sube al ascensor (abierto con la misión cumplida): conserva lo que lleva, acotado a lo que podía tener; ya no juega
+  sock.on('ascend', (inv) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    if (!r?.match || !p || r.phase !== 'playing' || !r.done || !r.match.canBoard(p)) return;
+    p.boarded = true;
+    p.inv = cleanInv(inv, p.cap);
+    r.boardAt ??= Date.now();
+    push(r);
+    checkOver(r);
+  });
+
+  // la votación de la misión (abierta al acabar la entrada por la puerta): un voto por jugador ('' lo quita)
+  sock.on('vote', (id) => {
+    const r = roomOf(sock.id);
+    if (!r || r.phase !== 'starting' || !r.voteEnd || r.chosen) return;
+    if (id === '') r.votes.delete(sock.id);
+    else if (typeof id === 'string' && r.pool.some((m) => m.id === id)) r.votes.set(sock.id, id);
+    else return;
+    push(r);
+  });
+
+  // la tienda: solo en el lobby; el dinero es de todos y el objeto, de quien lo compra
+  sock.on('buy', (id, cb) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id), it = shopItem(id);
+    const reply = (ok: boolean, error?: string) => typeof cb === 'function' && cb({ ok, error });
+    if (!r || !p || !it || r.phase !== 'lobby') return reply(false, 'NOT AVAILABLE');
+    const now = Date.now();
+    if (now - (p.lastBuy ?? 0) < 150) return reply(false, 'TOO FAST');
+    p.lastBuy = now;
+    if (!canHold(p.inv, it.id)) return reply(false, 'CANNOT CARRY MORE');
+    if (r.bank < it.price) return reply(false, 'NOT ENOUGH MONEY');
+    r.bank -= it.price;
+    p.inv = purchase(p.inv, it.id);
+    sock.emit('inv', p.inv);
+    push(r);
+    reply(true);
+  });
+
+  // soltar una unidad delante de uno: sale de lo que podía llevar y aparece en el suelo para todos
+  sock.on('drop', (kind, cb) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id), now = Date.now();
+    let ok = false;
+    // en la sala de espera también se suelta (de lo que se conserva, `inv`): lo del suelo vuelve a su dueño al empezar la ronda
+    if (r?.phase === 'lobby' && p && ITEM_IDS.includes(kind) && now - (p.lastDrop ?? 0) >= DROP_GAP && hasItem(p.inv, kind) && [...r.drops.values()].filter((d) => d.by === p.id).length < DROP_MAX) {
+      p.lastDrop = now;
+      p.inv = removeItem(p.inv, kind);
+      const id = 'd' + (++dropNo).toString(36);
+      r.drops.set(id, { id, kind, x: p.st.x - Math.sin(p.st.yaw) * 0.7, z: p.st.z - Math.cos(p.st.yaw) * 0.7, by: p.id, at: now });
+      sock.emit('inv', p.inv);
+      ok = true;
+    } else if (r?.match && p && r.phase === 'playing' && !p.dead && !p.boarded && ITEM_IDS.includes(kind) && now - (p.lastDrop ?? 0) >= DROP_GAP && hasItem(p.cap, kind) && [...r.drops.values()].filter((d) => d.by === p.id).length < DROP_MAX) {
+      p.lastDrop = now;
+      p.cap = removeItem(p.cap, kind);
+      let x = p.st.x - Math.sin(p.st.yaw) * 0.7, z = p.st.z - Math.cos(p.st.yaw) * 0.7;
+      if (solidAt(r.match.maze, x, z)) (x = p.st.x), (z = p.st.z); // con una pared delante, a sus pies
+      const id = 'd' + (++dropNo).toString(36);
+      r.drops.set(id, { id, kind, x, z, by: p.id, at: now });
+      ok = true;
+    }
+    if (typeof cb === 'function') cb(ok);
+  });
+
+  // una televisión apagada (misión «TURN OFF THE TVS»)
+  sock.on('tv', (i, cb) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    const ok = !!r?.match && !!p && r.phase === 'playing' && Number.isInteger(i) && r.match.tv(p, i);
+    if (typeof cb === 'function') cb(ok);
+  });
+
+  // una lata de Almond Water: la vida vuelve (la lleva el servidor) si de verdad la llevaba
+  sock.on('drink', () => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    if (!r?.match || !p || r.phase !== 'playing' || p.dead || p.boarded || p.cap.water <= 0) return;
+    p.cap.water--;
+    p.hp = HP_MAX;
+  });
+
+  // pistola de agua: el servidor decide a quién moja o para (el cliente solo pinta el chorro)
+  const squirtAt = new Map<string, number>();
+  sock.on('squirt', (a) => {
+    const r = roomOf(sock.id), p = r?.players.get(sock.id), now = Date.now();
+    if (!r?.match || !p || r.phase !== 'playing' || !a || !Number.isFinite(a.x) || !Number.isFinite(a.z) || !Number.isFinite(a.yaw)) return;
+    if (now - (squirtAt.get(sock.id) ?? 0) < 50) return; // ~20 mensajes/s
+    squirtAt.set(sock.id, now);
+    const hit = r.match.squirt(p, [...r.players.values()], a, now);
+    if (hit) io.to(hit.to.id).emit('wet', hit.ev);
   });
 
   sock.on('chat', (text) => {
@@ -343,6 +886,7 @@ setInterval(() => {
       io.to(r.code).emit('dead', p.id);
       push(r);
     });
+    roundTick(r);
     checkOver(r);
   }
 }, DT * 1000);
@@ -353,11 +897,20 @@ setInterval(() => {
     if (r.phase !== 'playing' && !inWait(r)) continue;
     // volatile: si el socket de alguien (un túnel lento) no ha terminado de vaciar lo anterior, este se descarta en vez de
     // encolarse: llega siempre lo último y no una ráfaga de estados viejos
-    io.to(r.code).volatile.emit('players', Object.fromEntries([...r.players].map(([id, p]) => [id, { ...p.st, name: p.name, dead: p.dead }])));
+    io.to(r.code).volatile.emit('players', Object.fromEntries([...r.players].map(([id, p]) => [id, { ...p.st, name: p.name, dead: p.dead, hp: p.dead ? 0 : p.hp }])));
   }
 }, 1000 / 15);
+const lobbyHad = new Set<string>(); // salas de espera a las que ya se mandó una lista con algo (para mandar también la vacía)
 setInterval(() => {
-  for (const r of rooms.values()) if (r.phase === 'playing' && r.match) io.to(r.code).volatile.emit('world', { ...r.match.snapshot(), t: Date.now() });
+  for (const r of rooms.values()) {
+    if (r.phase === 'playing' && r.match) io.to(r.code).volatile.emit('world', { ...r.match.snapshot(), drops: [...r.drops.values()].map(({ at: _a, ...d }) => d), t: Date.now() });
+    else if (r.phase === 'lobby') {
+      const now = Date.now();
+      for (const [id, d] of r.drops) if (now - d.at > DROP_TTL * 1000) r.drops.delete(id);
+      if (r.drops.size || lobbyHad.has(r.code)) io.to(r.code).volatile.emit('ldrops', [...r.drops.values()].map(({ at: _a, ...d }) => d));
+      r.drops.size ? lobbyHad.add(r.code) : lobbyHad.delete(r.code);
+    }
+  }
 }, 100);
 
 http.listen(Number(process.env.PORT) || SERVER_PORT, () => console.log(`backrooms server en :${process.env.PORT || SERVER_PORT}`));

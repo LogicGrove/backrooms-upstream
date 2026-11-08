@@ -1,9 +1,13 @@
+import { DEV_LOCAL } from '../devGate';
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import * as THREE from 'three';
 import { clone } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { ACHIEVEMENTS, COSMETICS, DEFAULT_LOOK, cleanLook, cosmetic, type CosmeticDef, type Look, type RoomView, type Slot } from '@backrooms/shared';
+import type { Inventory } from '@backrooms/shared';
 import type { Sock } from '../net';
+import type { Assets } from './game';
+import Shop from './Shop';
 import type { Account } from '../account';
 import RoomSettingsPanel from './RoomSettings';
 import { Cosmetics } from './cosmetics';
@@ -11,7 +15,7 @@ import { Thumbs, type ThumbSpec } from './wardThumbs';
 
 /*
  * La pantalla del ordenador de la sala de espera: un terminal CRT sobre la imagen (la cámara ya se ha acercado
- * a su pantalla). Arranca con unas líneas de BIOS y tiene dos pestañas: ROOM (los ajustes) y WARDROBE (el armario:
+ * a su pantalla). Arranca con unas líneas de BIOS y tiene tres pestañas: ROOM (los ajustes), SHOP (la tienda, con el dinero común) y WARDROBE (el armario:
  * una vista previa 3D del avatar, que gira, y COLOR / HEAD / BACK; lo bloqueado dice qué logro falta). Con cuenta, el
  * armario se guarda en el servidor (POST /api/loadout) y los demás lo ven; de invitado, solo los colores gratis, en local.
  * Se maneja con ratón o teclado: Tab, flechas, Intro; Escape o E (fuera de un campo de texto) cierran.
@@ -31,12 +35,17 @@ export function guestLook(): Look {
 
 /** El avatar girando en un lienzo pequeño: el rig hazmat clonado, con su aspecto puesto (tinte y accesorios, ver cosmetics.ts). */
 function Preview({ gltf, look, reduced }: { gltf?: GLTF; look: Look; reduced: boolean }) {
-  const cv = useRef<HTMLCanvasElement>(null);
+  const cv = useRef<HTMLSpanElement>(null);
   const lookRef = useRef(look);
   lookRef.current = look;
   useEffect(() => {
-    const canvas = cv.current;
-    if (!canvas || !gltf) return;
+    const box = cv.current;
+    if (!box || !gltf) return;
+    // un lienzo nuevo cada vez: tras forceContextLoss el de antes devolvería un contexto perdido (cuadrado negro)
+    const canvas = Object.assign(document.createElement('canvas'), { className: 'br-ward__cv' });
+    canvas.setAttribute('aria-label', 'Avatar preview');
+    canvas.setAttribute('role', 'img');
+    box.appendChild(canvas);
     const r = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     r.outputColorSpace = THREE.SRGBColorSpace;
     r.toneMapping = THREE.ACESFilmicToneMapping;
@@ -63,10 +72,11 @@ function Preview({ gltf, look, reduced }: { gltf?: GLTF; look: Look; reduced: bo
     const root = clone(gltf.scene);
     root.traverse((o) => void ((o as THREE.Mesh).isMesh && (o.frustumCulled = false)));
     const cos = new Cosmetics(root); // los accesorios van en el mundo, junto al cuerpo: dentro del mismo pivote
-    pivot.add(root, cos.root);
+    pivot.add(root);
+    scene.add(cos.root); // coordenadas de mundo: fuera del pivote que gira
     pivot.rotation.y = -0.5;
     scene.add(pivot);
-    if (process.env.NODE_ENV === 'development') Object.assign(window, { __pivot: pivot });
+    if (DEV_LOCAL) Object.assign(window, { __pivot: pivot });
     const mixer = new THREE.AnimationMixer(root);
     const clip = gltf.animations.find((c) => c.name === 'Neutral Idle') ?? gltf.animations[0];
     if (clip) mixer.clipAction(clip).play();
@@ -95,9 +105,10 @@ function Preview({ gltf, look, reduced }: { gltf?: GLTF; look: Look; reduced: bo
       cos.dispose(); // sus materiales son copias; la geometría y las texturas son del juego
       r.dispose();
       r.forceContextLoss();
+      canvas.remove();
     };
   }, [gltf, reduced]);
-  return gltf ? <canvas ref={cv} className="br-ward__cv" aria-label="Avatar preview" role="img" /> : <p className="br-lobby__dim">NO PREVIEW</p>;
+  return gltf ? <span ref={cv} style={{ display: 'contents' }} /> : <p className="br-lobby__dim">NO PREVIEW</p>;
 }
 
 const Lock = () => (
@@ -216,7 +227,7 @@ function Wardrobe({ gltf, reduced, acct, sock }: { gltf?: GLTF; reduced: boolean
   );
 }
 
-const PHASE: Record<RoomView['phase'], string> = { lobby: 'WAITING IN THE LOBBY', starting: 'THE DOOR IS OPENING', playing: 'IN PROGRESS', over: 'TAPE ENDED' };
+const PHASE: Record<RoomView['phase'], string> = { lobby: 'WAITING IN THE LOBBY', starting: 'VOTING', playing: 'IN PROGRESS', over: 'TAPE ENDED' };
 
 /** El resumen de la sala, a la derecha del terminal: código, estado y quién hay conectado (con su color). */
 function Summary({ room, me }: { room: RoomView; me: string }) {
@@ -259,8 +270,10 @@ function Summary({ room, me }: { room: RoomView; me: string }) {
   );
 }
 
-export default function Computer({ room, me, sock, hazmat, reduced = false, acct, onClose }: { room: RoomView; me: string; sock?: Sock; hazmat?: GLTF; reduced?: boolean; acct: Account; onClose: () => void }) {
-  const [tab, setTab] = useState<'room' | 'ward'>('room');
+type Tab = 'room' | 'shop' | 'ward';
+
+export default function Computer({ room, me, sock, hazmat, assets, inv, reduced = false, acct, onClose }: { room: RoomView; me: string; sock?: Sock; hazmat?: GLTF; assets?: Assets; inv: Inventory | null; reduced?: boolean; acct: Account; onClose: () => void }) {
+  const [tab, setTab] = useState<Tab>('room');
   const [boot, setBoot] = useState(reduced ? BOOT.length + 1 : 0); // líneas de BIOS ya escritas; > BOOT.length = arrancado
   const root = useRef<HTMLDivElement>(null);
   const booted = boot > BOOT.length;
@@ -274,7 +287,7 @@ export default function Computer({ room, me, sock, hazmat, reduced = false, acct
     if (!booted) root.current?.focus();
     else root.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
   }, [booted]);
-  const tabs: ['room' | 'ward', string][] = [['room', 'ROOM'], ['ward', 'WARDROBE']];
+  const tabs: [Tab, string][] = [['room', 'ROOM'], ['shop', 'SHOP'], ['ward', 'WARDROBE']];
   const nav = (e: KeyboardEvent<HTMLElement>) => {
     if (e.key === 'Escape') return void (e.preventDefault(), onClose());
     if (!booted) return void (e.preventDefault(), setBoot(BOOT.length + 1)); // cualquier tecla se salta el arranque
@@ -290,7 +303,7 @@ export default function Computer({ room, me, sock, hazmat, reduced = false, acct
   const tabKey = (e: KeyboardEvent<HTMLElement>) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
     e.preventDefault();
-    const next = tab === 'room' ? 'ward' : 'room';
+    const next = tabs[(tabs.findIndex(([k]) => k === tab) + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length][0];
     setTab(next);
     requestAnimationFrame(() => root.current?.querySelector<HTMLElement>(`#br-tab-${next}`)?.focus());
   };
@@ -300,7 +313,7 @@ export default function Computer({ room, me, sock, hazmat, reduced = false, acct
         <p className="br-pc__bar">
           <span>TERMINAL · ROOM {room.code}</span>
           <span className="br-lobby__dim">
-            {room.players.length}/{room.max} CONNECTED
+            BANK ${room.bank} · {room.players.length}/{room.max} CONNECTED
           </span>
         </p>
         {!booted ? (
@@ -328,6 +341,8 @@ export default function Computer({ room, me, sock, hazmat, reduced = false, acct
                   <RoomSettingsPanel room={room} me={me} sock={sock} />
                   <Summary room={room} me={me} />
                 </div>
+              ) : tab === 'shop' ? (
+                <Shop bank={room.bank} inv={inv} sock={sock} assets={assets} />
               ) : (
                 <Wardrobe gltf={hazmat} reduced={reduced} acct={acct} sock={sock} />
               )}

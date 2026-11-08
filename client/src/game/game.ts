@@ -1,15 +1,20 @@
+import { DEV_LOCAL } from '../devGate';
 import * as THREE from 'three';
 import { GLTFLoader, type GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
 import { compileGently } from './compile';
 import { CELL, generateMaze } from './maze';
-import { World, center } from './world';
-import { Input } from './input';
-import { Player } from './player';
+import { World, center, HEIGHT } from './world';
+import { FLASH } from './lightmap';
+import { Input, type Controls } from './input';
+import { Player, EYE, fit } from './player';
+import { HOT } from './quickslots';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { ShaderPass } from 'three/examples/jsm/postprocessing/ShaderPass.js';
+import { GTAOPass } from 'three/examples/jsm/postprocessing/GTAOPass.js';
+import { SMAAPass } from 'three/examples/jsm/postprocessing/SMAAPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { FilmShader, VhsShader } from './vhsPass';
 import { GameAudio } from './audio';
@@ -19,11 +24,21 @@ import { Shatter } from './shatter';
 import { TvRoom } from './tvRoom';
 import { unlock } from '../achievements';
 import { Remote } from './remote';
+import { Gadgets, ROLL } from './gadgets';
+import { loadAnimations } from './anim/animator';
+import { RunLevel, type RunHud } from './runlevel';
+import { PoolTest } from './pool';
+import { PoolLevel, loadPoolKit, type PoolKit } from './poolmap';
 import { WaitingRoom } from './waiting';
+import { Tvs } from './mission';
 import { holdStill } from './still';
 import { netStats, type Sock } from '../net';
 import { worldTl } from './interp';
-import { Breath, DEFAULT_LOOK, type Look, hideStates, tickHides, type HideState, type PlayerState, type RoomView, type WorldSnapshot } from '@backrooms/shared';
+import { settings } from '../settings';
+import { gearIcons } from './invIcons';
+import { prepAvatar } from './InvAvatar';
+import { AMMO_PACK, canHold, ITEM_IDS, START_INV, type AdminFx, makeMission, missionLine, tvCount, type ActiveMission, type Inventory, type ItemId, type MissionKind, type Maze, type LevelCaps, levelCaps } from '@backrooms/shared';
+import { Breath, DEFAULT_LOOK, HIT_DAMAGE, HP_MAX, REVIVE_IMMUNE, totemSpot, type Look, hideStates, tickHides, startOffset, type HideState, type PlayerState, type RoomView, type WorldSnapshot } from '@backrooms/shared';
 
 /** Lo que el juego necesita de una sala: el socket y quién soy. */
 export interface Mp {
@@ -33,11 +48,21 @@ export interface Mp {
   life?: number;
   /** Jugadores al empezar: de ellos depende cuántos recursos hay en el suelo (lo mismo calcula el servidor). */
   players?: number;
+  /** Mi puesto en la sala (para no salir todos en el mismo punto). */
+  index?: number;
+  /** Mi inventario según el servidor (la tienda y lo conservado): es con lo que empiezo la ronda. Sin él, el de quien llega nuevo. */
+  inv?: Inventory;
+  /** La misión elegida en la pizarra (con su progreso al empezar). */
+  mission?: ActiveMission | null;
+  /** El nivel de la ronda (LEVELS): por ahora level0 (el laberinto) o poolrooms. */
+  level?: string;
+  /** Capacidades del nivel que manda el servidor (LevelCaps): qué componentes del jugador están activos. */
+  caps?: LevelCaps;
 }
 
 /** Lo que enseña el inventario. */
 export interface Inv {
-  hand: 'none' | 'camera' | 'gun';
+  hand: 'none' | 'camera' | 'gun' | 'watergun';
   left: 'none' | 'flashlight';
   belt: 'none' | 'camera' | 'gun';
   stamina: number;
@@ -56,14 +81,48 @@ export interface Inv {
   battery: number; // la camcorder
   charge: number; // lo que le queda a la linterna (0–1)
   spares: number; // linternas de repuesto en la mochila
+  water: number; // latas de Almond Water
+  totem: number; // Tótems de la vida
+  radar: boolean;
+  /** Tiene cinta de acordonar. */
+  caution: boolean;
+  /** Lo que queda del rollo de cinta (0–1). */
+  tape: number;
+  /** La barra de acceso rápido: el objeto de cada ranura y la elegida. */
+  hot: (string | null)[];
+  hotSel: number;
+  gadget: 'none' | 'caution' | 'radar' | 'totem';
+  /** Poolrooms: la pistola de agua (se tiene) y lo que queda en su depósito (0–1). */
+  watergun?: boolean;
+  squirt?: number;
+  /** Poolrooms: la bombona de buceo (se tiene). */
+  tank?: boolean;
+  /** La bombona puesta (si no, va en la mochila). */
+  tankOn?: boolean;
+}
+
+/** La misión tal como la pinta el HUD. */
+export interface MissionHud {
+  kind: MissionKind;
+  /** «PHOTOGRAPH 3 ENTITIES»... */
+  text: string;
+  /** «PHOTOS 1/3»... */
+  line: string;
+  progress: number;
+  goal: number;
+  done: boolean;
 }
 
 /** Lo que el OSD enseña, leído desde React diez veces por segundo. */
 export interface Hud {
   bag: boolean;
   hint: string | null;
+  /** Aviso corto de la cinta (rollo vacío...). */
+  note: string | null;
   inv: Inv;
   aiming: boolean;
+  /** La mira del rifle (la retícula). */
+  scoped: boolean;
   zoom: number;
   focus: boolean;
   tapes: number;
@@ -76,11 +135,24 @@ export interface Hud {
   spectating: string | null;
   /** Espectador: los compañeros (el que se mira, marcado), si están vivos, y desde dónde se mira. */
   watchList?: { name: string; on: boolean; dead: boolean }[];
-  specView?: 'eyes' | 'chase';
+  specView?: 'eyes' | 'chase' | 'free';
   /** Cerca de un nicho y mirándolo: «E HIDE»; escondido: «E LEAVE». */
   hide: 'hide' | 'leave' | null;
+  /** Mi vida (0–100) y la de los demás de la sala por id (según el servidor). */
+  hp: number;
+  hps: Record<string, number>;
   /** Escondido: el aire (0–1), si una entidad lo inspecciona (hay que mantener Space) y si lo contiene. */
   breath: { air: number; warn: boolean; held: boolean } | null;
+  /** Se juega sin el puntero capturado (se reanudó con Esc): un clic lo captura. */
+  needClick: boolean;
+  /** La misión de la ronda y su progreso (la línea del HUD: «PHOTOS 1/3», «TVS 2/4», «SURVIVE 3:20»). `done`: el ascensor está abierto. */
+  mission: MissionHud | null;
+  /** Tras subir el primero al ascensor: si yo ya subí y los segundos que quedan para cerrar la ronda. Null si nadie ha subido. */
+  ascent: { boarded: boolean; left: number } | null;
+  /** Lo que haría G ahora si no es recoger algo («TURN OFF TV»). */
+  act: string | null;
+  /** El Tótem de la vida: el selector (compañeros caídos a los que se puede revivir; null cerrado), el nivel «Run for your life» si lo estoy corriendo, los avisos y los segundos de inmunidad que quedan. */
+  totem: { pick: { id: string; name: string }[] | null; run: RunHud | null; notes: string[]; immune: number };
 }
 
 const _spec = new THREE.Vector3(), _want = new THREE.Vector3(), _none = new THREE.Vector2();
@@ -91,7 +163,7 @@ const _spec = new THREE.Vector3(), _want = new THREE.Vector3(), _none = new THRE
  */
 
 const DIR = '/models/backrooms/';
-export const MODELS = ['hazmat', 'bacteria', 'partygoer', 'balloon', 'camcorder', 'vhs', 'gun', 'flashlight', 'elevator', 'vent', 'socket', 'exit', 'door', 'armchair'] as const;
+export const MODELS = ['hazmat', 'bacteria', 'partygoer', 'balloon', 'camcorder', 'vhs', 'gun', 'flashlight', 'water', 'elevator', 'vent', 'socket', 'exit', 'door', 'armchair', 'cabinet', 'shelf', 'chair', 'chair2', 'desk', 'crt', 'lamp', 'duct', 'radar', 'totem', 'hospital/stretcher', 'hospital/stools', 'hospital/curtain', 'hospital/extinguisher', 'hospital/cupboard', 'hospital/clock', 'hospital/exitdoor', 'hospital/locker', 'hospital/drip', 'hospital/wheelchair', 'hospital/shelf'] as const;
 export type ModelName = (typeof MODELS)[number];
 export const TEXTURES = ['wall', 'carpet', 'ceiling'] as const;
 
@@ -135,7 +207,7 @@ export async function loadAssets(progress: (f: number) => void): Promise<Assets>
   ]);
   // sin mapa de entorno un metal puro (metalness 1, el valor por defecto de glTF) no refleja nada y se ve gris o negro:
   // las piezas del suelo (cinta, rifle, linterna, globo) se quedan con un poco de metal y su color propio
-  for (const m of ['vhs', 'gun', 'flashlight', 'balloon'] as const)
+  for (const m of ['vhs', 'gun', 'flashlight', 'balloon', 'cabinet', 'shelf', 'chair', 'chair2', 'desk', 'crt', 'lamp', 'duct', 'radar'] as const)
     gltf[m].scene.traverse((o) => {
       const k = (o as THREE.Mesh).material as THREE.MeshStandardMaterial | undefined;
       if (k?.isMeshStandardMaterial) k.metalness = Math.min(k.metalness, 0.25);
@@ -157,7 +229,7 @@ export class BackroomsGame {
   // cuatro puntos que se van a las lámparas más cercanas
   // (la luz del mapa va horneada: ver lightmap.ts; estas alumbran a los personajes y lo que se recoge)
   readonly hemi = new THREE.HemisphereLight(0xfff1c4, 0x3a2c0c, 0.16);
-  readonly flash = new THREE.SpotLight(0xfff6e0, 0, 14, 0.45, 0.5, 1.6);
+  readonly flash = new THREE.SpotLight(0xfff6e0, 0, 22, 0.55, 0.75, 1.2);
   readonly points = Array.from({ length: 4 }, () => new THREE.PointLight(0xffefc6, 3, 7, 1.8));
   private clock = new THREE.Clock(false);
   private t = 0;
@@ -182,7 +254,7 @@ export class BackroomsGame {
           vec4 mv = modelViewMatrix * vec4(p, 1.0);
           float d = length(mv.xyz);
           // el haz: el cono de la linterna (mira al frente desde la cámara), más fuerte cerca
-          float beam = smoothstep(0.86, 0.97, dot(normalize(mv.xyz), vec3(0.0, -0.05, -1.0))) * uBeam * smoothstep(7.0, 1.0, d);
+          float beam = smoothstep(0.86, 0.97, dot(normalize(mv.xyz), vec3(0.0, -0.05, -1.0))) * uBeam * (1.0 - smoothstep(1.0, 7.0, d));
           // cada mota con su tamaño y su brillo, y un centelleo lento: unas pocas se ven siempre, flotando en la luz
           float h = fract(sin(dot(position, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
           float tw = 0.65 + 0.35 * sin(uTime * (0.6 + h * 1.4) + h * 40.0);
@@ -194,7 +266,7 @@ export class BackroomsGame {
         varying float vA;
         void main() {
           float r = length(gl_PointCoord - 0.5);
-          gl_FragColor = vec4(vec3(1.0, 0.93, 0.78) * vA * smoothstep(0.5, 0.1, r), 1.0);
+          gl_FragColor = vec4(vec3(1.0, 0.93, 0.78) * vA * (1.0 - smoothstep(0.1, 0.5, r)), 1.0);
         }`,
       transparent: true,
       depthWrite: false,
@@ -206,6 +278,12 @@ export class BackroomsGame {
   corruption = 0;
   player?: Player;
   items?: Items;
+  /** Las televisiones de la misión «TURN OFF THE TVS» (si es esa). */
+  tvs?: Tvs;
+  /** La misión de la ronda: en una sala, la del servidor (progreso y si está cumplida); solo, una sencilla que se lleva aquí. */
+  private mission: ActiveMission | null = null;
+  /** Tras subir el primero: segundos que quedaban al llegar el aviso, cuándo llegó y quiénes han subido. */
+  private ascent: { left: number; at: number; boarded: string[] } | null = null;
   onWin?: () => void;
   private black = 0;
   private winning = false;
@@ -217,7 +295,12 @@ export class BackroomsGame {
   private killer?: Entity;
   // la sala
   mp?: Mp;
+  /** Capacidades del nivel en curso (las del servidor; level0 si es solitario). */
+  caps: LevelCaps = levelCaps('level0');
   private remotes = new Map<string, Remote>();
+  /** La vida de cada jugador de la sala (0–100), según el servidor. */
+  private hps: Record<string, number> = {};
+  private gadgets?: Gadgets;
   private spare: Remote[] = [];
   /** El aspecto de cada jugador de la sala (lo manda el servidor con la sala). */
   private looks = new Map<string, Look>();
@@ -227,9 +310,26 @@ export class BackroomsGame {
   private lastFrame = 0;
   private spectating = false;
   private watching = '';
-  private specView: 'eyes' | 'chase' = 'eyes';
+  private specView: 'eyes' | 'chase' | 'free' = 'eyes';
+  /** La vista de espectador de antes de pasar a la cámara libre (C vuelve a ella). */
+  private specBack: 'eyes' | 'chase' = 'eyes';
+  private freePos = new THREE.Vector3();
+  private freeYaw = 0;
+  private freePitch = 0;
   private specPos = new THREE.Vector3();
   private god = false;
+  /** Consola de admin: solo si la cuenta es admin (Me.admin) o se está en desarrollo local. Cosmético (el cliente es del jugador): el servidor decide lo de las salas. */
+  adminOn = false;
+  private get adminOk() {
+    return this.adminOn || DEV_LOCAL;
+  }
+  /** Consola de admin: trucos de este cliente (se aplican cada fotograma). */
+  readonly cheats = { ammo: false, stamina: false, sanity: false, speed: 1, jump: 1, bright: false, slow: 1 };
+  private brightLight?: THREE.HemisphereLight;
+  /** Consola de admin: sin luz y entidades quietas (solo en este cliente / en solitario). */
+  private lightsOff = false;
+  private entFrozen = false;
+  private seed0 = 0;
   // los escondites (nichos de las paredes): en solitario los lleva la sim de las entidades; en una sala, el servidor
   private hides: HideState[] = [];
   private hideIdx = -1;
@@ -238,6 +338,43 @@ export class BackroomsGame {
   private inspected = false;
   private noise = 0;
   onDeath?: () => void;
+  // el Tótem de la vida: el selector abierto, quién corre «Run for your life» (id → nombre), un aviso suelto y la inmunidad al volver
+  private run?: RunLevel;
+  private pool?: PoolTest | PoolLevel;
+  private fx?: { ao: GTAOPass; smaa: SMAAPass };
+
+  /** Oclusión ambiental (GTAO, antes del bloom) y antialiasing (SMAA, ya en sRGB) solo dentro de las Poolrooms y fuera de la calidad baja. */
+  private poolFx(p?: PoolLevel) {
+    const c = this.composer;
+    if (this.fx && !p) {
+      c.removePass(this.fx.ao), c.removePass(this.fx.smaa);
+      this.fx.ao.dispose(), this.fx.smaa.dispose();
+      this.fx = undefined;
+    }
+    if (!p || this.opts.low) return;
+    if (!this.fx) {
+      const w = this.canvas.clientWidth || innerWidth, h = this.canvas.clientHeight || innerHeight, pr = this.renderer.getPixelRatio();
+      const ao = new GTAOPass(p.scene, p.camera, (w * pr) >> 1, (h * pr) >> 1), smaa = new SMAAPass(w * pr, h * pr), draw = ao.render.bind(ao), size = ao.setSize.bind(ao);
+      ao.setSize = (a: number, b: number) => size(a >> 1, b >> 1); // el AO a media resolución: cuesta la cuarta parte y apenas se nota
+      ao.updateGtaoMaterial({ radius: 0.9, distanceExponent: 1.5, thickness: 1.2, scale: 1, samples: 8 });
+      ao.blendIntensity = 0.85;
+      ao.render = (...a: Parameters<GTAOPass['render']>) => {
+        const lv = this.pool instanceof PoolLevel ? this.pool : undefined;
+        lv?.setWater(false), lv?.aoCull(true, 40, true);
+        draw(...a);
+        lv?.setWater(true), lv?.aoCull(false);
+      };
+      c.insertPass(ao, 1);
+      c.insertPass(smaa, c.passes.findIndex((x) => x instanceof OutputPass) + 1);
+      this.fx = { ao, smaa };
+    }
+    this.fx.ao.scene = p.scene;
+    this.fx.ao.camera = p.camera;
+  }
+  private totemOpen = false;
+  private runners = new Map<string, string>();
+  private note = { text: '', until: 0 };
+  private immuneUntil = 0;
   private snap?: THREE.WebGLRenderTarget;
   // la camcorder que sale volando al morir: la vista es ella
   private fly?: { pos: THREE.Vector3; vel: THREE.Vector3; q: THREE.Quaternion; spin: THREE.Vector3; bounced: boolean };
@@ -260,6 +397,22 @@ export class BackroomsGame {
   private fadeIn = 0;
   /** El ordenador de la sala de espera se abre o se cierra (lo oye el caparazón para sacar la pantalla de ajustes). */
   onWaitComputer?: (open: boolean) => void;
+  /** La pizarra de misiones de la sala de espera se abre o se cierra. */
+  onWaitBoard?: (open: boolean) => void;
+  /** El inventario (E) abierto en la sala de espera. */
+  onWaitBag?: (open: boolean) => void;
+  waitBag = false;
+  closeWaitBag() {
+    if (!this.waitBag) return;
+    this.waitBag = false;
+    this.input.suspend = false;
+    this.input.lock();
+    this.onWaitBag?.(false);
+  }
+  /** Un aviso corto sobre la sala de espera. */
+  waitSay(t: string) {
+    this.waiting?.say(t);
+  }
   /** Escenas prerenderizadas para la nieve del menú: cada una, unos fotogramas de una sala con entidades bailando (ver prerender). */
   stills: HTMLCanvasElement[][] = [];
   /** Sin sonido (lo decide el menú; se aplica al crear el audio si aún no existe). */
@@ -269,14 +422,18 @@ export class BackroomsGame {
 
   constructor(readonly canvas: HTMLCanvasElement, readonly opts: { low: boolean; reduced: boolean }) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+    this.renderer.localClippingEnabled = true; // (el agua dentro del depósito de la pistola de agua, poolmap.ts tankFx)
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 0.72; // sin la cinta encima, el amarillo quema
     // la sombra de la linterna, solo en escritorio
     this.renderer.shadowMap.enabled = !opts.low;
     this.flash.castShadow = !opts.low;
-    this.flash.shadow.mapSize.set(512, 512);
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.flash.shadow.mapSize.set(1024, 1024);
+    this.flash.shadow.radius = 4; // sombra suave (el borde de una pared no corta seco)
     this.flash.shadow.camera.near = 0.2;
+    this.flash.shadow.camera.far = 22;
     this.flash.shadow.bias = -0.002;
     this.input = new Input(canvas);
     // la imagen: escena, el halo de los fluorescentes (no en calidad baja), color de pantalla, el grano y,
@@ -303,7 +460,7 @@ export class BackroomsGame {
     this.flash.target.position.set(0, -0.3, -6);
     const resize = () => {
       // como mucho a 1080 líneas (y a la mitad en calidad baja): el grano y la cinta lo ablandan igual
-      const w = canvas.clientWidth || innerWidth, h = canvas.clientHeight || innerHeight, pr = Math.min(devicePixelRatio, 1080 / h) * (opts.low ? 0.6 : 1);
+      const w = canvas.clientWidth || innerWidth, h = canvas.clientHeight || innerHeight, pr = Math.min(devicePixelRatio, 1080 / h) * (opts.low ? 0.6 : 1) * settings.resScale;
       this.renderer.setPixelRatio(pr);
       this.renderer.setSize(w, h, false);
       this.composer?.setPixelRatio(pr);
@@ -312,6 +469,8 @@ export class BackroomsGame {
       if (this.vhs) this.vhs.uniforms.uAspect.value = w / h;
       this.film?.uniforms.uRes.value.set(w * pr, h * pr);
       this.tv?.resize(w / h);
+      this.run?.resize(w / h);
+      this.pool?.resize(w / h);
       this.waiting?.resize(w / h);
       this.camera.aspect = w / h;
       this.camera.updateProjectionMatrix();
@@ -378,6 +537,10 @@ export class BackroomsGame {
     const report = progress;
     progress = (f) => ((this.tvProgress = f), report(f));
     this.assets = await loadAssets((f) => progress(f * 0.8));
+    prepAvatar(this.assets); // y el muñeco del inventario (con sus shaders compilados), listo antes de abrirlo
+    await loadAnimations().catch((e) => console.error('animations', e)); // (el paquete de animaciones del jugador: sin él, los clips del modelo)
+    await loadPoolKit(); // (el tanque y la pistola de agua salen de ahí; sin él no tienen icono)
+    gearIcons(this.assets); // los iconos del inventario se pintan aquí, en la carga: la primera vez creaban un contexto WebGL y daban un tirón al abrirlo
     // compilar con un laberinto cualquiera y el jugador con todo en las manos, en la pantalla de carga
     // (en Firefox, sin paralelo, es lento)
     const w = new World(generateMaze(1), this.assets), p = new Player(w, this.assets, this.camera, this.flash, true);
@@ -458,7 +621,7 @@ export class BackroomsGame {
       cam.lookAt(eye.clone().add(new THREE.Vector3(dx, -0.04, dz).multiplyScalar(8)).addScaledVector(side, (Math.random() - 0.5) * 0.8));
       cam.rotateZ((Math.random() - 0.5) * 0.12);
       cam.updateMatrixWorld(true);
-      this.flash.intensity = torch ? 26 : 0;
+      this.flash.intensity = torch ? FLASH : 0;
       const frames: HTMLCanvasElement[] = [];
       for (let f = 0; f < 3; f++) {
         // el baile avanza entre fotogramas (el primero, desde un punto cualquiera del clip)
@@ -477,6 +640,7 @@ export class BackroomsGame {
   }
 
   start(seed: number, mp?: Mp) {
+    this.seed0 = seed;
     this.fadeIn = this.waiting ? 0.9 : 0; // de la sala de espera a la partida: el negro de la entrada se abre
     this.leaveWaiting();
     this.stopMp();
@@ -484,6 +648,16 @@ export class BackroomsGame {
     this.shatters.forEach((s) => s.dispose());
     this.shatters = [];
     this.spectating = false;
+    this.endRun();
+    this.totemOpen = false;
+    this.immuneUntil = 0;
+    this.gadgets?.dispose();
+    this.tvs?.dispose();
+    this.tvs = undefined;
+    this.audio?.tvStatic(0);
+    this.ascent = null;
+
+    this.endPool();
     this.player?.dispose();
     this.world?.dispose();
     this.black = 0;
@@ -491,6 +665,7 @@ export class BackroomsGame {
     this.dying = -1;
     this.killer = undefined;
     this.outT = -1;
+    this.lightsOff = this.entFrozen = false;
     this.nextOut = 70 + Math.random() * 50;
     this.audio?.power(1);
     this.bagOpen = false;
@@ -500,31 +675,60 @@ export class BackroomsGame {
     this.noise = 0;
     this.breath.reset();
     this.vhs.uniforms.uCorrupt.value = 0;
+    this.hides = []; // (las Poolrooms no tienen nichos; sin esto quedan los de la ronda anterior)
+    this.caps = mp?.caps ?? levelCaps(mp?.level ?? 'level0');
+    if (mp && this.caps.pool) return void this.startPool(seed, mp);
     // desarrollo: &god, inmortal
-    this.god = !mp && process.env.NODE_ENV === 'development' && new URLSearchParams(location.search).has('god');
+    this.god = !mp && DEV_LOCAL && new URLSearchParams(location.search).has('god');
     const w = (this.world = new World(generateMaze(seed, mp?.players ?? 1), this.assets!));
+    w.maze.totem = totemSpot(w.maze, seed, mp?.players ?? 1); // el Tótem de la vida, si toca (como en el servidor)
     this.scene.add(w.root);
     const m = w.maze, s = m.start;
     this.hides = hideStates(m);
     const p = (this.player = new Player(w, this.assets!, this.camera, this.flash, this.opts.reduced));
     if (mp?.life) p.life = mp.life;
-    if (mp) p.spares = 1; // en una sala cada uno empieza con una linterna de repuesto en el bolsillo
+    p.onDrink = () => (this.audio?.drink(), this.mp?.sock.emit('drink'));
+    if (mp) p.load(mp.inv ?? START_INV); // en una sala se empieza con el inventario del servidor (tienda y lo conservado), no desnudo
     // mirando hacia el primer lado abierto (con yaw = 0 se mira a -z)
     const side = [[1, 0], [-1, 0], [0, 1], [0, -1]].find(([dx, dy]) => m.open[(s.y + dy) * m.w + s.x + dx]) ?? [0, -1];
-    p.spawn(center(s), Math.atan2(-side[0], -side[1]));
+    const at0 = center(s), [sx, sz] = startOffset(mp?.index ?? 0);
+    if (mp) (at0.x += sx), (at0.z += sz);
+    p.spawn(at0, Math.atan2(-side[0], -side[1]));
+    if (!mp && DEV_LOCAL && new URLSearchParams(location.search).has('totem')) m.totem = { x: s.x + side[0], y: s.y + side[1] }; // desarrollo: &totem pone el tótem junto al inicio
     p.onFall = () => {
-      if (this.mp) (this.sendState(), this.mp.sock.emit('fell'));
+      if (this.mp && this.caps.fall) (this.sendState(), this.mp.sock.emit('fell'));
       this.die();
     };
     this.audio ??= new GameAudio(undefined, this.muted, this.volume);
-    const it = (this.items = new Items(w, this.assets!, p, this.camera, this.audio));
+    // la misión: la del servidor o, solo, una al azar (las cintas solo se colocan si la misión es encontrarlas)
+    this.mission = mp ? (mp.mission ?? null) : this.soloMission(m);
+    const it = (this.items = new Items(w, this.assets!, p, this.camera, this.audio, this.mission?.kind === 'tapes'));
     it.onWin = () => this.win();
+    it.ready = !!this.mission?.done;
+    if (this.mission?.kind === 'tvs') {
+      this.tvs = new Tvs(w, this.assets!, this.mission.goal);
+      if (mp) this.tvs.claim = (i, done) => mp.sock.emit('tv', i, done);
+    }
+    this.gadgets = new Gadgets(w, p, this.camera, this.assets!, this.canvas.parentElement ?? document.body, () => this.remotes.values());
     // al empezar, una de cada: la bacteria y el partygoer, en los arranques más lejanos
     // (en una sala las lleva el servidor y llegan en el snapshot del mundo)
     this.entities = mp ? [] : (['bacteria', 'partygoer'] as Kind[]).map((k, i) => new Entity(k, w, this.assets!, m.spawns[i] ?? m.spawns[0]));
     it.targets = this.entities;
-    if (mp) this.wire(mp, it);
+    this.gadgets.onTotem = () => this.openTotem();
+    if (mp) (this.wire(mp, it), this.gadgets.net(mp.sock));
+    if (mp) {
+      // la pistola de agua también en el nivel 0 (sin recarga): el chorro avisa al servidor y lo que me hacen los demás llega como 'wet'
+      let sq = 0;
+      p.onSquirt = (x, z, yaw) => (mp.sock.volatile.emit('squirt', { x, z, yaw }), performance.now() - sq > 120 && ((sq = performance.now()), this.audio?.squirt()));
+      const onWet = (m: { kind: 'wet' | 'stun'; ms: number }) => p.hit(m.kind, m.ms);
+      mp.sock.on('wet', onWet);
+      this.offNet.push(() => mp.sock.off('wet', onWet));
+    }
     it.onKill = (t, from) => this.kill(t as Entity, from);
+    if (mp) {
+      it.peers = () => [...this.remotes.values()].filter((r) => !r.dead && !r.hiding).map((r) => ({ id: r.id, at: r.pos.clone().setY(r.pos.y + 1) }));
+      it.onShootPlayer = (id) => mp.sock.emit('shoot', id);
+    }
     this.input.begin();
     this.audio.start();
     this.t = 0;
@@ -534,11 +738,15 @@ export class BackroomsGame {
   }
 
   private frame() {
-    const dt = Math.min(this.clock.getDelta(), 0.05);
+    const dt = Math.min(this.clock.getDelta(), 0.05) * (this.mp ? 1 : this.cheats.slow); // (cámara lenta: solo en solitario)
     this.lastFrame = performance.now();
     // en una sala la pausa no detiene el mundo (los demás siguen jugando): solo se sueltan los mandos
-    if (this.paused && !this.mp) return;
+    if (this.paused && (!this.mp || this.run)) return;
     const c = this.input.read();
+    if (this.run) return this.runFrame(dt, c);
+    this.vhs.uniforms.uPool.value = this.film.uniforms.uVhs.value = this.pool instanceof PoolLevel ? 1 : 0; // (el aspecto de cinta de las Poolrooms: sin amarillo, con barrido y croma)
+    if (this.pool) return this.poolFrame(dt, c);
+    if (this.totemOpen && c.bag) (c.bag = false), this.closeTotem(); // Esc o E cierran el selector del Tótem
     // el inventario: E lo abre y lo cierra (Escape también lo cierra, sin pausar)
     if (this.dying < 0 && !this.winning && c.bag) {
       if (this.bagOpen) this.closeBag();
@@ -549,14 +757,23 @@ export class BackroomsGame {
       return this.pause();
     }
     this.t += dt;
+    if (this.player) (this.player.speedMul = this.cheats.speed), (this.player.jumpMul = this.cheats.jump);
+    if (this.brightLight) this.brightLight.visible = this.cheats.bright;
     if (!this.spectating || this.player?.dead) this.player?.update(dt, c);
     // escondido, las manos están quietas: nada de recoger, disparar ni linterna
-    const hiding = !!this.player && this.player.hideState !== 'out', cc = hiding ? { ...c, grab: false, fire: false, reload: false, flash: false, swap: false, aim: false, zoom: 0 } : c;
+    const hiding = !!this.player && this.player.hideState !== 'out';
+    let cc = hiding ? { ...c, grab: false, fire: false, reload: false, flash: false, swap: false, slot: -1, wheel: 0, use: false, aim: false, zoom: 0 } : c;
     if (c.flash && this.dying < 0 && !hiding) this.audio?.click();
-    if (this.dying < 0) this.items?.update(this.t, dt, cc);
+    if (this.dying < 0) {
+      this.gadgets && (cc = this.gadgets.update(dt, cc));
+      this.player && this.tvs && (cc = this.tvs.update(dt, this.player, cc, this.audio));
+      this.items?.update(this.t, dt, cc);
+      if (cc.drop) this.dropSelected();
+    }
+    if (!this.mp) this.soloTick();
     this.hideFrame(dt, c.hold);
     this.monsters(dt);
-    if (this.mp) this.netFrame(dt);
+    if (this.mp) this.netFrame(dt, c);
     if (this.dying >= 0 && !this.spectating) this.dyingFrame(dt);
     // pasos: uno cada ~0,7 m andando (algo más largos corriendo), si se pisa suelo
     const p = this.player;
@@ -618,9 +835,16 @@ export class BackroomsGame {
   get hud(): Hud {
     const p = this.player;
     const battery = Math.max(0.15, 1 - this.t / 900);
-    const inv: Inv = { left: p?.left ?? 'flashlight', belt: p?.belt ?? 'none', stamina: p?.stamina ?? 1, sanity: p?.sanity ?? 1, escaped: this.winning, hand: p?.hand ?? 'none', camera: !!p?.has.camera, gun: !!p?.has.gun, ammo: p?.ammo ?? 0, spare: p?.spare ?? 0, tapes: this.items?.tapes ?? 0, photos: this.items?.photos ?? 0, thumbs: this.items?.thumbs ?? [], full: this.items?.full ?? [], flashOn: !!p?.flashOn, battery, charge: p?.charge ?? 1, spares: p?.spares ?? 0 };
+    const inv: Inv = { left: p?.left ?? 'flashlight', belt: p?.belt ?? 'none', stamina: p?.stamina ?? 1, sanity: p?.sanity ?? 1, escaped: this.winning, hand: p?.hand ?? 'none', camera: !!p?.has.camera, gun: !!p?.has.gun, ammo: p?.ammo ?? 0, spare: p?.spare ?? 0, tapes: this.items?.tapes ?? 0, photos: this.items?.photos ?? 0, thumbs: this.items?.thumbs ?? this.pics.thumbs, full: this.items?.full ?? this.pics.full, flashOn: !!p?.flashOn, battery, charge: p?.charge ?? 1, spares: p?.spares ?? 0, water: p?.water ?? 0, hot: p?.hot ?? [], hotSel: p?.hotSel ?? 0, gadget: p?.gadget ?? 'none', totem: p?.totem ?? 0, radar: !!p?.radar, caution: !!p?.caution, tape: (this.gadgets?.left ?? ROLL) / ROLL };
+    // la pistola de agua y el tanque se conservan en el nivel 0 (aunque no sirvan allí): siguen en la mochila y en la ranura de equipo
+    const gear = p?.inventory;
+    if (gear) Object.assign(inv, { tank: gear.tank, tankOn: p!.tankOn, watergun: gear.watergun, squirt: p!.squirt });
+    const pl = this.pool instanceof PoolLevel ? this.pool : undefined;
+    if (pl && this.mp?.inv?.watergun) Object.assign(inv, { watergun: true, squirt: pl.squirtLeft, hot: ['watergun', ...(p?.hot.slice(1) ?? [null, null, null])], hand: pl.gunOn ? 'watergun' : 'none' });
+    if (pl && this.mp?.inv?.tank) inv.tank = true;
     const hidden = !!p && p.hideState !== 'out';
-    return { bag: this.bagOpen, hint: hidden ? null : this.items?.hint ?? null, hide: this.dying >= 0 || this.winning || this.spectating ? null : hidden ? (p!.hideState === 'hidden' ? 'leave' : null) : this.hideNear() ? 'hide' : null, breath: p?.concealed ? { air: this.breath.air, warn: this.inspected, held: this.holding } : null, inv, aiming: !!p?.aiming, zoom: p?.zoom ?? 1, focus: !!this.items?.focus, tapes: this.items?.tapes ?? 0, photos: this.items?.photos ?? 0, ammo: p?.has.gun ? p.ammo : null, spare: p?.spare ?? 0, battery, time: this.t, spectating: this.spectating ? (this.remotes.get(this.watching)?.name ?? '') : null, watchList: this.spectating ? [...this.remotes.values()].map((r) => ({ name: r.name, on: r.id === this.watching, dead: r.dead })) : undefined, specView: this.spectating ? this.specView : undefined };
+    const ms = this.mission, up = this.ascent;
+    return { mission: ms ? { kind: ms.kind, text: ms.text, line: missionLine(ms), progress: ms.progress, goal: ms.goal, done: ms.done } : null, ascent: up ? { boarded: !!this.mp && up.boarded.includes(this.mp.id), left: Math.max(0, up.left - (performance.now() - up.at) / 1000) } : null, act: hidden || this.run ? null : this.tvs?.hint ?? pl?.act ?? null, totem: this.totemHud(), needClick: this.input.needClick, bag: this.bagOpen, note: this.gadgets?.note ?? null, hint: hidden || this.run || this.tvs?.hint ? null : this.gadgets?.hint ?? this.items?.hint ?? pl?.hint ?? null, hide: this.dying >= 0 || this.winning || this.spectating ? null : hidden ? (p!.hideState === 'hidden' ? 'leave' : null) : this.hideNear() ? 'hide' : null, breath: p?.concealed ? { air: this.breath.air, warn: this.inspected, held: this.holding } : null, inv, aiming: !!p?.aiming, scoped: !!p?.scoped && !this.spectating, zoom: p?.zoom ?? 1, focus: !!this.items?.focus, tapes: this.items?.tapes ?? 0, photos: this.items?.photos ?? 0, ammo: p?.has.gun ? p.ammo : null, spare: p?.spare ?? 0, battery, time: this.t, hp: p?.hp ?? HP_MAX, hps: this.hps, spectating: this.spectating && !this.run ? (this.remotes.get(this.watching)?.name ?? '') : null, watchList: this.spectating && !this.run ? [...this.remotes.values()].map((r) => ({ name: r.name, on: r.id === this.watching && this.specView !== 'free', dead: r.dead })) : undefined, specView: this.spectating && !this.run ? this.specView : undefined };
   }
 
   /** Lo abierto que es el sitio: las celdas libres en 7 × 7 alrededor (0–1). */
@@ -636,6 +860,7 @@ export class BackroomsGame {
   private outT = -1;
   private blackouts(dt: number) {
     const w = this.world!;
+    if (this.lightsOff) return void (w.power = 0);
     if (this.outT < 0) {
       if (this.t > this.nextOut && this.dying < 0 && !this.winning) this.outT = 0;
       return;
@@ -658,8 +883,8 @@ export class BackroomsGame {
     const torch = p.lightOn ? this.camera.getWorldDirection(new THREE.Vector3()) : null;
     const occ = this.mp ? [] : this.hides.filter((h) => h.occ); // (en una sala las entidades las lleva el servidor)
     for (const e of this.entities) {
-      if (!e.alive) continue;
-      if (e.update(dt, p.pos, eye, torch, exposed, this.god, occ, p.concealed) && this.dying < 0) this.die(e);
+      if (!e.alive || this.entFrozen) continue;
+      if (e.update(dt, p.pos, eye, torch, exposed, this.god, occ, p.concealed, p.duck) && this.dying < 0) this.hurt(e);
       near[e.kind] = Math.min(near[e.kind], e.pos.distanceTo(p.pos));
     }
     if (this.dying < 0) {
@@ -668,9 +893,18 @@ export class BackroomsGame {
       // la cordura: a la luz se recupera; a oscuras se va (más deprisa sin linterna) y cerca de ellas, más
       const m = this.world!.maze, lit = this.world!.power > 0.5 && m.lit[Math.floor(p.pos.z / CELL) * m.w + Math.floor(p.pos.x / CELL)];
       const close = Math.min(near.bacteria, near.partygoer);
-      const d = (lit ? 1 / 90 : p.lightOn ? -1 / 240 : -1 / 70) - (close < 10 ? (1 - close / 10) / 20 : 0);
+      let d = (lit ? 1 / 90 : p.lightOn ? -1 / 240 : -1 / 70) - (close < 10 ? (1 - close / 10) / 20 : 0);
+      if (p.concealed && this.holding && d < 0) d = 0; // escondido y aguantando la respiración: la cordura no baja (aunque tengan cerca)
       p.sanity = THREE.MathUtils.clamp(p.sanity + d * dt, 0, 1);
+      if (this.cheats.sanity) p.sanity = 1;
+      // sin cordura se muere (como al caer): en una sala lo da por bueno el servidor
+      if (this.caps.insane && p.sanity <= 0 && !this.god && !this.winning) {
+        if (this.mp && this.caps.insane) (this.sendState(), this.mp.sock.emit('insane'));
+        this.die();
+      }
     }
+    if (this.cheats.stamina) p.stamina = 1;
+    if (this.cheats.ammo) (p.ammo = AMMO_PACK), (p.squirt = 1);
     this.film.uniforms.uMad.value = this.dying < 0 ? 1 - (p.sanity) : 0;
     this.shatters = this.shatters.filter((s) => s.update(dt));
     this.balloons = this.balloons.filter((b) => {
@@ -762,6 +996,13 @@ export class BackroomsGame {
     e.dispose();
   }
 
+  /** Una entidad te alcanza (en solitario; en una sala lo decide el servidor): quita vida y, si queda, sigue; sin vida, o escondido (sin salida), te pillan. */
+  private hurt(e: Entity) {
+    const p = this.player!;
+    p.hp = p.concealed ? 0 : Math.max(0, p.hp - HIT_DAMAGE);
+    if (p.hp <= 0) this.die(e);
+  }
+
   /** Te pillan o te caes: la cámara al suelo, la entidad baila, la cinta se come y el cuelgue falso. */
   private die(e?: Entity) {
     if (this.dying >= 0 || this.winning || (this.god && e)) return;
@@ -832,11 +1073,6 @@ export class BackroomsGame {
         cam.fov = THREE.MathUtils.lerp(cam.fov, 62, Math.min(1, dt * 4));
       }
       cam.updateProjectionMatrix();
-      // y baila encima del cuerpo
-      if (t > 1.5 && e.state === 'attack') {
-        e.pos.copy(p.corpse);
-        e.dance(p.pos);
-      }
     } else this.black = THREE.MathUtils.clamp((t - 0.6) / 2.4, 0, 1); // al vacío: se cae a negro
     this.corrupt(THREE.MathUtils.clamp((t - 0.8) / 3.8, 0, 1));
     if (t > 4.8 && this.dying < 100) {
@@ -847,13 +1083,67 @@ export class BackroomsGame {
     }
   }
 
+  // ── la misión ────────────────────────────────────────────────────────────
+
+  /** La misión de una partida en solitario: una al azar, sin dinero. */
+  private soloMission(m: Maze): ActiveMission {
+    const tvs = tvCount(m), kinds: MissionKind[] = ['photos', 'tapes', 'survive', ...(tvs >= 3 ? (['tvs'] as const) : [])];
+    return { ...makeMission(kinds[(Math.random() * kinds.length) | 0], Math.random, 'solo', tvs), progress: 0, done: false };
+  }
+
+  /** Solo: el progreso de la misión sale de lo que se hace aquí; al cumplirse se abre el ascensor. */
+  private soloTick() {
+    const m = this.mission, it = this.items;
+    if (!m || m.done || !it) return;
+    m.progress = Math.min(m.goal, m.kind === 'photos' ? it.photos : m.kind === 'tapes' ? it.tapes : m.kind === 'survive' ? Math.floor(this.t) : (this.tvs?.off ?? 0));
+    if (m.progress >= m.goal) (m.done = true), this.missionDone();
+  }
+
+  /** En una sala: la misión y el ascensor según el servidor. */
+  private roomUpdate(r: RoomView) {
+    const was = !!this.mission?.done;
+    this.mission = r.mission;
+    this.ascent = r.ascent ? { left: r.ascent.left, at: performance.now(), boarded: r.ascent.boarded } : null;
+    if (r.mission?.done && !was) this.missionDone();
+    if (this.items) this.items.ready = !!r.mission?.done;
+  }
+
+  /** La misión se ha cumplido: aviso y ascensor abierto (se abre al acercarse). */
+  private missionDone() {
+    if (this.items) this.items.ready = true;
+    this.note = { text: 'MISSION COMPLETE · GO TO THE ELEVATOR', until: performance.now() + 6000 };
+    this.audio?.done();
+  }
+
+  /** Y: suelta una unidad del objeto elegido de la barra rápida. */
+  private dropSelected() {
+    const id = this.player?.hot[this.player.hotSel];
+    if (id && (ITEM_IDS as string[]).includes(id)) this.dropItem(id as ItemId);
+  }
+  /** Suelta una unidad de `id` delante de uno para los compañeros (solo en una sala): el servidor comprueba que la llevaba y la pone en el suelo para todos. */
+  dropItem(id: ItemId) {
+    const p = this.player, lobby = this.lobbyP, mp = lobby ? this.waitMp : this.mp;
+    if (!p || !mp || (!lobby && (this.dying >= 0 || this.winning || this.spectating || p.hideState !== 'out')) || !p.owns(id)) return;
+    // (en la sala de espera el servidor devuelve el inventario con `inv` y `waitRoom` lo aplica)
+    mp.sock.emit('drop', id, (ok) => ok && !lobby && (p.lose(id), this.poolInv()));
+  }
+  /** Poolrooms: lo que llevo ha cambiado (soltar, coger): el inventario de la sala, el tanque y la pistola de agua al día. */
+  private poolInv() {
+    const pl = this.pool, mp = this.mp, p = this.player;
+    if (!(pl instanceof PoolLevel) || !mp || !p) return;
+    mp.inv = p.inventory;
+    pl.tank = p.tankWorn;
+    if (!mp.inv.watergun) pl.gunOn = false;
+    pl.hasGun = !!mp.inv.watergun;
+  }
+
   /** Dentro del ascensor: las puertas se cierran, la grabación se corta a negro y «Noclip». */
   private win() {
     this.winning = true;
     this.player!.frozen = true;
     this.bagOpen = false;
     unlock('backrooms');
-    this.mp?.sock.emit('exit');
+    this.mp?.sock.emit('ascend', this.player!.inventory); // sube con lo que lleva; el servidor lo acota y cierra la ronda cuando suben todos o se acaba el tiempo
     setTimeout(() => this.onWin?.(), 2500);
   }
 
@@ -948,6 +1238,14 @@ export class BackroomsGame {
       this.waiting = wr;
       this.waitMp = mp;
       wr.spawn(Math.max(0, room.players.findIndex((p) => p.id === mp.id)));
+      // el controlador de siempre, también aquí: manos con IK, linterna, objetos y barra rápida. La sala pone la posición, el salto y el agachado; el Player, lo que se ve
+      const stub = { root: wr.scene, solid: (x: number, z: number) => wr.solid(x, z), furniture: () => false, voidAt: () => false } as unknown as World;
+      wr.scene.add(wr.camera);
+      const lp = (this.player = new Player(stub, this.assets!, wr.camera, this.flash, this.opts.reduced));
+      lp.poolMode = true;
+      lp.drinkOff = true;
+      this.lobbyP = true;
+      wr.camera.add(this.flash, this.flash.target); // (leaveWaiting la devuelve a la cámara del juego)
       wr.sfx = (n) => {
         const a = this.audio;
         if (n === 'creak') a?.creak();
@@ -964,6 +1262,21 @@ export class BackroomsGame {
         else this.input.lock();
         this.onWaitComputer?.(open);
       };
+      wr.onVend = (done) => mp.sock.emit('buy', 'water', done);
+      wr.onBag = () => {
+        this.waitBag = true;
+        this.input.clear();
+        this.input.suspend = true;
+        this.input.unlock();
+        this.onWaitBag?.(true);
+      };
+      wr.onBoard = (open) => {
+        this.input.clear();
+        this.input.suspend = open;
+        if (open) this.input.unlock();
+        else this.input.lock();
+        this.onWaitBoard?.(open);
+      };
       this.audio ??= new GameAudio(undefined, this.muted, this.volume);
       this.audio.start();
       this.waitRoom(room);
@@ -974,10 +1287,14 @@ export class BackroomsGame {
       // las teclas 1–4 son los emotes (no mientras se escribe)
       const emoteKey = (e: KeyboardEvent) => {
         if (e.repeat || (e.target as HTMLElement | null)?.tagName === 'INPUT' || !/^Digit[1-4]$/.test(e.code)) return;
-        wr.doEmote(Number(e.code.slice(5)));
+        const n = Number(e.code.slice(5)), lp = this.player, id = lp?.hot[n - 1];
+        if (this.lobbyP && id && HOT[id]?.have(lp!.own)) return; // una ranura con objeto: la usa el Player; solo las vacías son emotes
+        wr.doEmote(n);
       };
       addEventListener('keydown', emoteKey);
-      this.offWait.push(() => (mp.sock.off('players', onPlayers), clearInterval(beat), removeEventListener('keydown', emoteKey)));
+      const onLDrops = (list: { id: string; kind: string; x: number; z: number }[]) => this.syncLobbyDrops(list);
+      mp.sock.on('ldrops', onLDrops);
+      this.offWait.push(() => (mp.sock.off('players', onPlayers), mp.sock.off('ldrops', onLDrops), clearInterval(beat), removeEventListener('keydown', emoteKey)));
       const rp = this.composer.passes[0] as RenderPass;
       rp.scene = wr.scene;
       rp.camera = wr.camera;
@@ -1002,11 +1319,15 @@ export class BackroomsGame {
   }
 
   /** Lo que la sala dice de sí misma (propietario, fase, ajustes): la pantalla del ordenador y, si empieza la partida, la entrada. */
-  waitRoom(room: RoomView) {
+  waitRoom(room: RoomView, inv?: Inventory | null) {
     const wr = this.waiting, mp = this.waitMp;
     if (!wr || !mp) return;
+    wr.bank = room.bank;
+    wr.inv = inv ?? null;
+    if (inv && this.lobbyP) this.player?.apply(inv); // lo que lleva el servidor (comprado, soltado, recogido) va a las manos y la barra
     this.waitPhase = room.phase;
     wr.owner = room.ownerId === mp.id;
+    wr.setBoard(room.round, room.levelId);
     const DIFF = { easy: 'EASY', normal: 'NORMAL', hard: 'HARD' } as const;
     wr.setScreen(['BACKROOMS', `ROOM ${room.code}`, room.name.toUpperCase(), `${room.public ? 'PUBLIC' : 'PRIVATE'} ${room.players.length}/${room.max}`, `DIFFICULTY ${DIFF[room.difficulty]}`, `SEED ${room.fixedSeed || 'RANDOM'}`]);
     if (room.phase === 'starting' && !wr.entering) {
@@ -1022,7 +1343,7 @@ export class BackroomsGame {
   /** Lo que el caparazón enseña sobre la sala de espera. */
   get waitHud() {
     const wr = this.waiting;
-    return { ready: !!wr, hint: wr?.hint ?? null, label: wr?.hintLabel ?? '', notice: wr?.notice ?? '', computer: wr?.mode === 'computer', entering: !!wr?.entering, locked: this.input.locked, free: wr?.mode === 'free' };
+    return { ready: !!wr, hint: wr?.hint ?? null, label: wr?.hintLabel ?? '', notice: wr?.notice ?? '', computer: wr?.mode === 'computer', board: wr?.mode === 'board', entering: !!wr?.entering, locked: this.input.locked, free: wr?.mode === 'free' };
   }
 
   /** Se cumple cuando la entrada por la puerta ha terminado (enseguida si no hay sala de espera). */
@@ -1030,8 +1351,87 @@ export class BackroomsGame {
     return this.waiting ? this.waiting.whenDone() : Promise.resolve();
   }
 
+  /**
+   * Durante la votación de la misión: se prepara el nivel que viene (el laberinto de la semilla y su mundo, con los materiales ya compilados en
+   * la carga) para que al empezar la partida no haya tirón. Cede el hilo entre un paso y otro; resuelve cuando está.
+   */
+  async warmLevel(seed: number, players: number, level = 'level0') {
+    const a = this.assets;
+    if (level === 'poolrooms') return void (await loadPoolKit()); // (el nivel se arma al empezar; las piezas ya están bajadas y leídas)
+    if (!a) return;
+    const tick = () => new Promise((r) => setTimeout(r, 30));
+    await tick();
+    const maze = generateMaze(seed, players);
+    await tick();
+    new World(maze, a).dispose();
+    await tick();
+  }
+
   closeComputer() {
     this.waiting?.closeComputer();
+  }
+
+  private lobbyP = false;
+  private lobbyHid = false;
+  private lobbyVis: boolean[] = [];
+  /** Lo soltado en la sala de espera: id → su modelo en el suelo (lo manda el servidor con `ldrops`). */
+  private lobbyDrops = new Map<string, THREE.Object3D>();
+
+  /** El Player en la sala de espera: se le da mi posición, mirada y altura (la sala los lleva) y se le deja poner manos, objetos y linterna. Con la cámara de otro sitio (sentado, ante la pantalla) se esconden. */
+  private lobbyHands(dt: number, c: Controls, wr: WaitingRoom) {
+    const me = this.player;
+    if (!me || !this.lobbyP) return;
+    const items = Object.values(me.items);
+    if (!wr.driving || this.paused) {
+      if (!this.lobbyHid) (this.lobbyVis = items.map((i) => i.visible)), items.forEach((i) => (i.visible = false)), (me.rig.root.visible = false), (this.lobbyHid = true);
+      this.flash.intensity = 0;
+      return;
+    }
+    if (this.lobbyHid) (items.forEach((it, k) => (it.visible = this.lobbyVis[k] ?? false)), (this.lobbyHid = false));
+    const cam = wr.camera, pos = cam.position.clone(), rot = cam.rotation.clone();
+    me.pos.set(wr.pos.x, cam.position.y - EYE, wr.pos.z);
+    me.yaw = wr.yaw;
+    me.pitch = wr.pitch;
+    me.update(dt, { ...c, jump: false, crouch: false });
+    cam.position.copy(pos);
+    cam.rotation.copy(rot);
+    cam.updateMatrixWorld();
+    if (c.drop) this.dropSelected();
+    wr.lit = me.lightOn;
+    wr.held = me.hand === 'camera' || me.hand === 'gun' ? me.hand : 'none';
+    this.flash.intensity = me.lightOn ? FLASH * 0.6 : 0;
+    this.lobbyPick(c, wr);
+  }
+
+  /** G: recoger lo soltado más cercano (a menos de 2,5 m); el servidor lo da si cabe. */
+  private lobbyPick(c: Controls, wr: WaitingRoom) {
+    const mp = this.waitMp;
+    if (!mp || !c.grab) return;
+    let best = '', bd = 2.5;
+    for (const [id, o] of this.lobbyDrops) {
+      const d = Math.hypot(o.position.x - wr.pos.x, o.position.z - wr.pos.z);
+      if (d < bd) (bd = d), (best = id);
+    }
+    if (best) mp.sock.emit('pickup', best, (ok: boolean) => (ok ? this.audio?.pickup() : wr.say('CANNOT CARRY MORE')));
+  }
+
+  /** Lo soltado en el suelo de la sala de espera: los nuevos se ponen con su modelo, los que ya no están se quitan. */
+  private syncLobbyDrops(list: { id: string; kind: string; x: number; z: number }[]) {
+    const wr = this.waiting, a = this.assets;
+    if (!wr || !a) return;
+    const here = new Set(list.map((d) => d.id));
+    for (const [id, o] of this.lobbyDrops) if (!here.has(id)) (o.removeFromParent(), this.lobbyDrops.delete(id));
+    const g = a.gltf;
+    const model: Record<string, [THREE.Object3D | undefined, number]> = { flashlight: [g.flashlight?.scene, 0.24], camera: [g.camcorder?.scene, 0.22], gun: [g.gun?.scene, 0.72], water: [g.water?.scene, 0.17], caution: [g.duct?.scene, 0.16], radar: [g.radar?.scene, 0.2], totem: [g.totem?.scene, 0.5] };
+    for (const d of list) {
+      if (this.lobbyDrops.has(d.id)) continue;
+      const m = model[d.kind];
+      const o = m?.[0] ? fit(m[0].clone(true), m[1]) : new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.08, 0.08), new THREE.MeshStandardMaterial({ color: 0xb08d3a, roughness: 0.5 }));
+      o.position.set(d.x, 0.1, d.z);
+      o.rotation.y = (d.x * 3.1 + d.z) % 6.28;
+      wr.scene.add(o);
+      this.lobbyDrops.set(d.id, o);
+    }
   }
 
   private waitSend() {
@@ -1040,14 +1440,17 @@ export class BackroomsGame {
   }
 
   private waitFrame() {
+    this.vhs.uniforms.uPool.value = this.film.uniforms.uVhs.value = 0;
     const dt = Math.min(this.clock.getDelta(), 0.05), wr = this.waiting;
     this.lastFrame = performance.now();
     if (!wr) return;
     this.t += dt;
     const c = this.input.read();
+    if (this.waitBag && (c.bag || c.pause)) (c.bag = c.pause = false), this.closeWaitBag(); // E o Esc cierran el inventario
     // pausa (Esc, el puntero soltado): la sala sigue y los demás se ven; solo se sueltan los mandos
     if (c.pause && wr.mode === 'free' && !this.paused) this.pause();
     wr.update(dt, this.paused || wr.mode === 'starting' ? { ...c, move: _none.clone(), look: _none.clone(), bag: false, run: false } : c);
+    this.lobbyHands(dt, c, wr);
     for (const r of this.remotes.values()) r.update(dt);
     if (wr.speed > 0) {
       this.stepAcc += wr.speed * dt;
@@ -1074,9 +1477,19 @@ export class BackroomsGame {
     this.offWait = [];
     this.waitMp = undefined;
     this.waitPhase = '';
+    this.waitBag = false;
     const wr = this.waiting;
     if (!wr) return;
     this.waiting = undefined;
+    if (this.lobbyP) {
+      (this.lobbyP = false), (this.lobbyHid = false);
+      this.player?.dispose();
+      this.player = undefined;
+      for (const o of this.lobbyDrops.values()) o.removeFromParent();
+      this.lobbyDrops.clear();
+      this.camera.add(this.flash, this.flash.target);
+      this.flash.intensity = 0;
+    }
     wr.dispose();
     for (const r of this.remotes.values()) (r.root.removeFromParent(), this.spare.push(r));
     this.remotes.clear();
@@ -1093,14 +1506,19 @@ export class BackroomsGame {
   // ── la sala ──────────────────────────────────────────────────────────────
 
   /** Escuchar a la sala: los demás jugadores, el mundo (entidades y objetos) y las muertes. */
-  private wire(mp: Mp, items: Items) {
+  private wire(mp: Mp, items?: Items) {
     this.mp = mp;
     const s = mp.sock;
     worldTl.reset(100); // snapshots del mundo cada 100 ms
-    const onPlayers = (all: Record<string, PlayerState & { name: string; dead: boolean }>) => this.syncRemotes(all, mp.id, this.scene);
+    const onPlayers = (all: Record<string, PlayerState & { name: string; dead: boolean }>) => {
+      for (const id in all) this.hps[id] = all[id].hp ?? HP_MAX;
+      if (this.player && all[mp.id]?.hp !== undefined) this.player.hp = all[mp.id].hp!;
+      this.syncRemotes(all, mp.id, this.pool instanceof PoolLevel ? this.pool.scene : this.scene);
+    };
     const onWorld = (w: WorldSnapshot) => this.applyWorld(w);
     const onDead = (id: string) => {
       if (id !== mp.id) return this.remotes.get(id)?.die();
+      if (this.pool instanceof PoolLevel) return this.poolDied(this.pool);
       if (this.dying >= 0 || this.winning || !this.player) return;
       // quien te ha pillado: la entidad más cerca (el servidor lo sabe antes de que llegue el siguiente snapshot)
       const p = this.player.pos;
@@ -1113,21 +1531,63 @@ export class BackroomsGame {
       if (!this.spectating || (e.target as HTMLElement | null)?.tagName === 'INPUT') return;
       if (e.code === 'ArrowLeft' || e.code === 'ArrowRight' || e.code === 'Tab') (e.preventDefault(), this.watch(e.code === 'ArrowLeft' ? -1 : 1));
       else if (e.code === 'KeyV') this.specView = this.specView === 'eyes' ? 'chase' : 'eyes';
+      else if (e.code === 'KeyC') this.toggleFree();
       else if (/^Digit[1-3]$/.test(e.code)) {
         const live = [...this.remotes.values()].filter((r) => !r.dead), t = live[Number(e.code.slice(5)) - 1];
         if (t) this.watching = t.id;
       }
     };
+    // el Tótem de la vida: un caído corre «Run for your life» (todos lo ven en el HUD) y, al acabar, vuelve junto a quien lo usó
+    const onReviving = (m: { id: string; name: string; by: string }) => {
+      this.runners.set(m.id, m.name);
+      if (m.id === mp.id && !this.pool) this.beginRun(); // (el Run for your life es del nivel 0)
+    };
+    const onRunFailed = (m: { id: string; name: string }) => {
+      this.runners.delete(m.id);
+      this.note = { text: `${m.id === mp.id ? 'YOU' : m.name.toUpperCase()} DID NOT MAKE IT`, until: performance.now() + 4000 };
+      if (m.id !== mp.id) return;
+      this.endRun();
+      this.black = 0;
+      this.input.suspend = false;
+      this.input.soft();
+      this.input.lock();
+    };
+    const onRevived = (m: { id: string; name: string; x: number; y: number; z: number; yaw: number }) => {
+      this.runners.delete(m.id);
+      this.note = { text: `${m.id === mp.id ? 'YOU ARE' : m.name.toUpperCase() + ' IS'} BACK`, until: performance.now() + 4000 };
+      if (m.id !== mp.id) return this.remotes.get(m.id)?.revive();
+      if (this.pool instanceof PoolLevel) return this.poolRevived(this.pool, m);
+      this.endRun();
+      this.dying = -1;
+      this.killer = undefined;
+      this.spectating = false;
+      this.fly = undefined;
+      this.black = 0;
+      this.corrupt(0);
+      this.immuneUntil = performance.now() + REVIVE_IMMUNE;
+      this.player?.revive(new THREE.Vector3(m.x, 0, m.z), m.yaw);
+      for (const r of this.remotes.values()) r.setFirstPerson(false);
+      this.input.suspend = false;
+      this.input.soft();
+      this.input.lock();
+    };
+    // la sala cambia (misión, progreso, ascensor): lo que el servidor dice manda
+    const onRoom = (r: RoomView) => this.roomUpdate(r);
+    s.on('room', onRoom);
     s.on('players', onPlayers);
     s.on('world', onWorld);
     s.on('dead', onDead);
+    s.on('reviving', onReviving);
+    s.on('revived', onRevived);
+    s.on('runFailed', onRunFailed);
     addEventListener('keydown', key);
+    document.addEventListener('visibilitychange', this.onVisible);
+    this.offNet.push(() => document.removeEventListener('visibilitychange', this.onVisible));
     // con la pestaña oculta o la ventana sin foco el navegador para los fotogramas: la sala sigue sabiendo dónde estoy
     const beat = setInterval(() => performance.now() - this.lastFrame > 150 && !this.spectating && this.sendState(), 1000 / 15);
     this.offNet.push(() => clearInterval(beat));
-    this.offNet.push(() => (s.off('players', onPlayers), s.off('world', onWorld), s.off('dead', onDead), removeEventListener('keydown', key)));
-    items.claim = (id, done) => s.emit('pickup', id, done);
-    items.onPhoto = () => s.emit('photo');
+    this.offNet.push(() => (s.off('room', onRoom), s.off('players', onPlayers), s.off('world', onWorld), s.off('dead', onDead), s.off('reviving', onReviving), s.off('revived', onRevived), s.off('runFailed', onRunFailed), removeEventListener('keydown', key)));
+    if (items) (items.claim = (id, done) => s.emit('pickup', id, done)), (items.onPhoto = () => s.emit('photo'));
   }
 
   /** Los demás jugadores según lo que dice el servidor: se crean (con un clon reutilizado, en `parent`), se mueven y se quitan los que ya no están. */
@@ -1143,7 +1603,7 @@ export class BackroomsGame {
         r.reset(id, st.name);
         r.setLook(this.looks.get(id) ?? DEFAULT_LOOK);
         // en la sala de espera: sombra falsa y pasos (con volumen y lado según dónde esté respecto a mí)
-        r.floorShadow = parent !== this.scene;
+        r.floorShadow = !!this.waiting && parent === this.waiting.scene;
         r.onStep = r.floorShadow ? (rr, run) => this.remoteStep(rr, run) : undefined;
         parent.add(r.root);
         this.remotes.set(id, r);
@@ -1171,18 +1631,29 @@ export class BackroomsGame {
     for (const r of this.remotes.values()) (r.root.removeFromParent(), this.spare.push(r));
     this.remotes.clear();
     this.entMap.clear();
+    this.runners.clear();
     this.mp = undefined;
   }
+
+  private resync = false;
+  private onVisible = () => {
+    if (!document.hidden) this.resync = true;
+  };
 
   /** El snapshot del servidor: las entidades (las nuevas se crean, las que faltan han muerto) y los objetos. */
   private applyWorld(w: WorldSnapshot) {
     const world = this.world, mp = this.mp;
     if (!world || !mp) return;
     const here = new Set<number>(), now = performance.now(), t = w.t ?? now;
+    // al volver de otra pestaña el reloj de interpolación y los estados guardados son de antes del parón (los paquetes llegan en
+    // ráfaga): se parte de cero y las entidades se colocan ya donde dice el servidor (si no, se quedaban clavadas en las paredes)
+    const resync = this.resync;
+    if (resync) (this.resync = false), worldTl.reset(100);
     worldTl.push(t, now); // el reloj del mundo (hora del servidor): las entidades se dibujan algo en el pasado, con el ritmo del servidor
     for (const s of w.ents) {
       here.add(s.id);
       let e = this.entMap.get(s.id);
+      if (e && resync) (e.track.buf.length = 0), e.net(s, true, t);
       if (!e) {
         e = new Entity(s.kind, world, this.assets!, world.cellAt(s.x, s.z), s.speed, s.hp, true);
         e.id = s.id;
@@ -1201,23 +1672,39 @@ export class BackroomsGame {
         else e.dispose();
       }
     this.items?.sync(w.taken, w.tapes);
+    if (this.pool instanceof PoolLevel) {
+      this.pool.sync(w.taken);
+      this.pool.syncDrops(w.drops ?? []);
+      for (const d of w.drops ?? []) this.dropKind.set(d.id, d.kind);
+    }
+    this.items?.syncDrops(w.drops ?? []);
+    this.tvs?.sync(w.tvOff ?? [], this.audio);
     this.inspected = !!w.insp?.includes(mp.id);
   }
 
   /** Cada fotograma en una sala: los demás, lo que yo mando (15 Hz) y, si estoy muerto, la cámara del compañero. */
-  private netFrame(dt: number) {
+  private netFrame(dt: number, c: Controls) {
     for (const r of this.remotes.values()) r.update(dt);
     if (!this.spectating) {
       this.sendT += dt;
       if (this.sendT >= 1 / 15) (this.sendT = 0), this.sendState();
       return;
     }
+    this.specCam(dt, c);
+  }
+
+  /** La cámara del espectador (la del juego o, en las Poolrooms, la del nivel). */
+  private get cam() {
+    return this.pool instanceof PoolLevel ? this.pool.camera : this.camera;
+  }
+  private specCam(dt: number, c: Controls) {
+    if (this.specView === 'free') return this.freeFrame(dt, c);
     const live = [...this.remotes.values()].filter((r) => !r.dead);
     let t = this.remotes.get(this.watching);
     if (!t || t.dead) t = live[0];
     this.watching = t?.id ?? '';
     if (!t) return void (this.flash.intensity = 0);
-    const cam = this.camera, eye = _spec.set(t.pos.x, t.pos.y + 1.62, t.pos.z);
+    const cam = this.cam, eye = _spec.set(t.pos.x, t.pos.y + 1.62, t.pos.z);
     const chase = this.specView === 'chase';
     for (const r of this.remotes.values()) r.setFirstPerson(r === t && !chase);
     if (!chase) {
@@ -1237,15 +1724,45 @@ export class BackroomsGame {
       cam.lookAt(eye.x + fx * 1.5, eye.y - 0.15, eye.z + fz * 1.5);
     }
     cam.updateMatrixWorld();
-    this.flash.intensity = t.light ? 22 : 0;
+    this.flash.intensity = t.light ? FLASH * 0.85 : 0;
+  }
+
+  /** C: entra o sale de la cámara libre (entra desde donde está la cámara ahora). */
+  private toggleFree() {
+    if (this.specView === 'free') return void (this.specView = this.specBack);
+    this.specBack = this.specView;
+    this.freePos.copy(this.cam.position);
+    const e = new THREE.Euler().setFromQuaternion(this.cam.quaternion, 'YXZ');
+    this.freeYaw = e.y;
+    this.freePitch = e.x;
+    this.specView = 'free';
+  }
+
+  /** Cámara libre del espectador: vuela sin colisión (WASD hacia donde mira, Shift más rápido), dentro del área del mapa. No toca la simulación. */
+  private freeFrame(dt: number, c: Controls) {
+    const cam = this.cam, m = this.world?.maze;
+    this.freeYaw -= c.look.x;
+    this.freePitch = THREE.MathUtils.clamp(this.freePitch - c.look.y, -1.55, 1.55);
+    cam.rotation.set(this.freePitch, this.freeYaw, 0, 'YXZ');
+    const v = (c.run ? 9 : 3.5) * dt;
+    this.freePos.addScaledVector(_want.set(0, 0, -1).applyQuaternion(cam.quaternion), c.move.y * v);
+    this.freePos.addScaledVector(_want.set(1, 0, 0).applyQuaternion(cam.quaternion), c.move.x * v);
+    if (m) (this.freePos.x = THREE.MathUtils.clamp(this.freePos.x, 0, m.w * CELL)), (this.freePos.z = THREE.MathUtils.clamp(this.freePos.z, 0, m.h * CELL));
+    this.freePos.y = THREE.MathUtils.clamp(this.freePos.y, 0.3, HEIGHT - 0.2);
+    cam.position.copy(this.freePos);
+    this.specPos.copy(this.freePos);
+    for (const r of this.remotes.values()) r.setFirstPerson(false);
+    cam.updateMatrixWorld();
+    this.flash.intensity = 0;
   }
 
   private sendState() {
     const p = this.player;
     if (!p || !this.mp) return;
+    if (this.pool instanceof PoolLevel) return this.poolState(this.pool);
     // volatile: si el túnel va atascado, este estado se pierde en vez de encolarse (el siguiente lleva lo último); t: la hora de ahora, para que
     // los demás reconstruyan mi ritmo aunque los paquetes lleguen tarde o juntos
-    this.mp.sock.volatile.emit('state', { x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: p.yaw, pitch: p.pitch, anim: p.rig.current?.getClip().name ?? 'Neutral Idle', light: p.lightOn, held: p.concealed ? 'none' : p.hand, hiding: p.concealed, holding: this.holding, t: performance.now() });
+    this.mp.sock.volatile.emit('state', { x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: p.yaw, pitch: p.pitch, anim: 'Neutral Idle', dance: p.dancing || undefined, variant: p.variant || undefined, light: p.lightOn, duck: p.duck, held: p.concealed || p.hand === 'watergun' ? 'none' : p.hand, hiding: p.concealed, holding: this.holding, t: performance.now() });
   }
 
   /** Estado de la red para depurar (consola: `__game.netInfo()`): ping, jitter y retraso de dibujo de cada jugador y del mundo. */
@@ -1273,9 +1790,522 @@ export class BackroomsGame {
     this.watching = live[(i + dir + live.length * 2) % live.length].id;
   }
 
+  // ── el Tótem de la vida ──────────────────────────────────────────────────
+
+  /** Clic con el tótem en la mano: el selector de compañeros caídos (vacío: «NO ONE TO REVIVE», y no se gasta). El puntero queda suelto como con el inventario. */
+  private openTotem() {
+    if (this.totemOpen || this.run || this.spectating || this.dying >= 0) return;
+    this.totemOpen = true;
+    this.input.clear();
+    this.input.suspend = true;
+    this.input.unlock();
+  }
+  closeTotem() {
+    if (!this.totemOpen) return;
+    this.totemOpen = false;
+    this.input.suspend = false;
+    this.input.lock();
+  }
+  /** Elegido un compañero: el servidor comprueba que lo llevo y que está muerto; solo entonces se gasta. */
+  useTotem(id: string) {
+    const p = this.player;
+    this.closeTotem();
+    this.mp?.sock.emit('totem', id, (ok) => {
+      if (!ok || !p) return;
+      p.totem = Math.max(0, p.totem - 1);
+      if (!p.totem) p.gadget = 'none';
+    });
+  }
+  /** Caídos a los que se puede revivir (los que no corren ya). */
+  private deadMates() {
+    return [...this.remotes.values()].filter((r) => r.dead && !this.runners.has(r.id)).map((r) => ({ id: r.id, name: r.name }));
+  }
+  private totemHud(): Hud['totem'] {
+    const now = performance.now(), me = this.mp?.id;
+    const notes = [...this.runners].filter(([id]) => id !== me && this.remotes.has(id)).map(([, n]) => `${n.toUpperCase()} IS RUNNING FOR THEIR LIFE`);
+    if (now < this.note.until) notes.push(this.note.text);
+    return { pick: this.totemOpen ? this.deadMates() : null, run: this.run?.hud ?? null, notes, immune: Math.max(0, (this.immuneUntil - now) / 1000) };
+  }
+
+  /** Empieza «Run for your life» (runlevel.ts): su escena y su cámara sustituyen a las del juego en el compositor hasta que se acaba. */
+  private beginRun() {
+    if (this.run || !this.assets) return;
+    this.totemOpen = this.bagOpen = false;
+    this.input.suspend = false;
+    this.audio ??= new GameAudio(undefined, this.muted, this.volume);
+    const r = (this.run = new RunLevel(this.assets, this.audio, this.opts.reduced, this.camera.aspect));
+    r.onDone = () => this.mp?.sock.emit('runDone'); // el servidor lo comprueba y manda `revived`; hasta entonces, la imagen se queda en negro
+    r.onFail = () => (this.mp ? this.mp.sock.emit('runFail') : this.endRun()); // una sola oportunidad: el servidor lo da por muerto (`runFailed`)
+    const rp = this.composer.passes[0] as RenderPass;
+    rp.scene = r.scene;
+    rp.camera = r.camera;
+    this.flash.intensity = 0;
+    this.corrupt(0);
+    this.input.soft(); // el puntero se pide sin gesto: si el navegador no lo da, un clic
+    this.input.lock();
+  }
+
+  /** Cada fotograma del nivel: lo lleva el cliente (Esc pausa como siempre). */
+  private runFrame(dt: number, c: Controls) {
+    const r = this.run!;
+    // en una sala, perder el foco (otra ventana) no debe congelar la carrera: solo Esc con foco pausa
+    if (c.pause && (!this.mp || document.hasFocus())) return this.pause();
+    this.t += dt;
+    r.update(dt, c);
+    const u = this.vhs.uniforms;
+    this.vhs.enabled = r.glitch > 0.01 || r.black > 0.01;
+    u.uTime.value = this.film.uniforms.uTime.value = this.t;
+    u.uCorrupt.value = r.glitch;
+    u.uBlack.value = r.black;
+    u.uFlash.value = 0;
+    u.uAspect.value = this.camera.aspect;
+    this.composer.render(dt);
+  }
+
+  /** Vuelve a la escena del juego. */
+  private endRun() {
+    const r = this.run;
+    if (!r) return;
+    this.run = undefined;
+    r.dispose();
+    const rp = this.composer.passes[0] as RenderPass;
+    rp.scene = this.scene;
+    rp.camera = this.camera;
+    this.vhs.enabled = false;
+    this.vhs.uniforms.uCorrupt.value = this.vhs.uniforms.uBlack.value = 0;
+    this.vhs.uniforms.uPool.value = this.film.uniforms.uVhs.value = 0;
+    this.vhs.uniforms.uAspect.value = this.camera.aspect;
+  }
+
+  /** Desarrollo (`?pool`): el cuarto de prueba del agua de las Poolrooms (pool.ts). Sin VHS ni sala. */
+  async devPool(level = false) {
+    this.input.suspend = false;
+    const kit = level ? await loadPoolKit() : {};
+    const p = (this.pool = level ? new PoolLevel(this.camera.aspect, this.renderer, Number(new URLSearchParams(location.search).get('seed')) || 1, kit) : new PoolTest(this.camera.aspect, this.renderer));
+    if (DEV_LOCAL) (window as unknown as { __pool?: PoolTest | PoolLevel }).__pool = p; // consola: __pool.splash(x, z, 1.5)
+    if (p instanceof PoolLevel) this.poolFx(p);
+    const rp = this.composer.passes[0] as RenderPass;
+    rp.scene = p.scene;
+    rp.camera = p.camera;
+    this.flash.intensity = 0;
+    this.vhs.enabled = false;
+    this.input.soft();
+    this.input.lock();
+    this.input.begin();
+    this.clock.start();
+    this.renderer.setAnimationLoop(() => this.frame());
+  }
+
+  private poolFrame(dt: number, c: Controls) {
+    const pl = this.pool!, me = this.player;
+    if (this.mp) {
+      if (c.pause) return this.pause();
+      // el inventario: la tecla lo abre y lo cierra (como en el nivel 0; ni muerto ni subiendo)
+      if (c.bag) this.bagOpen ? this.closeBag() : pl instanceof PoolLevel && (pl.dead || this.winning) ? undefined : this.openBag();
+      if (pl instanceof PoolLevel) c = this.poolMatch(pl, dt, c);
+    }
+    pl.update(dt, me?.winded && c.run ? { ...c, run: false } : c); // sin aguante no se corre (el Player lo gasta en poolHands)
+    this.poolHands(pl, dt, c);
+    if (this.spectating) this.specCam(dt, c);
+    // la cinta (líneas de barrido, croma) fuera del nivel: solo el grano de la película, que se mueve
+    // (mirando por la cámara de fotos sí: el visor con la cinta, como en el nivel 0)
+    const aim = !!me?.aiming && !this.spectating;
+    this.vhs.enabled = aim;
+    this.vhs.uniforms.uAspect.value = this.camera.aspect;
+    this.vhs.uniforms.uTime.value = this.film.uniforms.uTime.value = this.t += dt;
+    this.film.uniforms.uMad.value = 0;
+    const t0 = performance.now();
+    this.renderer.info.autoReset = false; // el compositor hace varias pasadas: se cuentan todas y se reinicia aquí
+    this.renderer.info.reset();
+    this.composer.render(dt);
+    if (this.picSnap) {
+      this.picSnap = false;
+      this.pics.thumbs.push(this.shot(160, 120, 0.7));
+      this.pics.full.push(this.shot(960, 720, 0.88));
+    }
+    // medición (paso 2 del plan): CPU de envío por fotograma, draw calls y triángulos; texto fijo arriba a la izquierda
+    const s = (this.poolStat ??= { n: 0, ms: 0, el: Object.assign(document.createElement('pre'), { style: 'position:fixed;left:8px;top:8px;margin:0;color:#fff;font:12px monospace;z-index:9;pointer-events:none;text-shadow:0 0 3px #000' }) });
+    if (!s.el.isConnected && !this.mp) document.body.append(s.el);
+    s.n++, (s.ms += performance.now() - t0);
+    if (s.n >= 30 && this.mp) s.n = s.ms = 0;
+    else if (s.n >= 30) {
+      const i = this.renderer.info.render;
+      s.el.textContent = `render ${(s.ms / s.n).toFixed(2)} ms cpu
+calls ${i.calls}  tris ${i.triangles}
+fps ${(1 / Math.max(dt, 1e-3)).toFixed(0)}`;
+      s.n = s.ms = 0;
+    }
+  }
+  /** Las manos y la linterna del Player encima de la cámara del nivel: se le da mi posición y mirada, se le deja pintar y se devuelve la cámara tal como la dejó PoolLevel. */
+  private poolHands(pl: PoolTest | PoolLevel, dt: number, c: Controls) {
+    const me = this.player;
+    if (!me || !(pl instanceof PoolLevel)) return;
+    const cam = pl.camera, pos = cam.position.clone(), rot = cam.rotation.clone(), st = pl.state;
+    me.pos.set(st.x, cam.position.y - EYE, st.z);
+    me.yaw = st.yaw;
+    me.pitch = st.pitch;
+    me.dead = pl.dead; // muerto: el Player tumba el cuerpo y esconde las manos
+    // sin saltar, agacharse ni apuntar (lo mueve PoolLevel); la barra rápida y la rueda las lleva poolMatch
+    // la cámara de fotos sí se apunta (clic derecho, zoom) y dispara, salvo nadando o muerto
+    const cam_ok = !pl.dead && !st.swim && !this.winning;
+    me.update(dt, { ...c, jump: false, crouch: false, aim: c.aim && cam_ok, zoom: cam_ok ? c.zoom : 0, slot: -1, wheel: 0, use: false, swap: false });
+    if (!cam_ok && me.aiming) (me.aiming = false), (me.zoom = 1);
+    if (st.swim && !pl.dead) me.rig.root.visible = false; // nadando el cuerpo colgaba bajo la vista (se veía una copia del personaje andando en el fondo)
+    if (c.fire && cam_ok && me.hand === 'camera' && me.aiming && this.t - this.picAt > 0.8) {
+      this.picAt = this.t;
+      this.picSnap = true;
+      this.audio?.shutter();
+    }
+    cam.position.copy(pos);
+    cam.rotation.copy(rot);
+    cam.updateMatrixWorld();
+  }
+  /** Fotos de las Poolrooms (no hay Items allí): miniaturas y grandes, y el pedido de captura al pintar. */
+  private pics = { thumbs: [] as string[], full: [] as string[] };
+  private picSnap = false;
+  private picAt = -9;
+  private poolStat?: { n: number; ms: number; el: HTMLPreElement };
+
+  /** Una ronda de las Poolrooms con compañeros: el mapa y el movimiento son de PoolLevel; la sala (misión, ascensor, compañeros) funciona como siempre. */
+  private async startPool(seed: number, mp: Mp) {
+    const tok = ++this.poolTok;
+    this.pics = { thumbs: [], full: [] };
+    this.renderer.setAnimationLoop(null);
+    this.player = undefined;
+    this.world = undefined;
+    this.items = undefined;
+    this.gadgets = undefined;
+    this.tvs = undefined;
+    this.entities = [];
+    // indicador de carga: se pinta antes de que el armado (síncrono y pesado) congele el hilo
+    const load = Object.assign(document.createElement('div'), { textContent: 'LOADING POOLROOMS…' });
+    load.style.cssText = 'position:fixed;inset:0;display:grid;place-items:center;background:#000;color:#fff;font:14px monospace;letter-spacing:.2em;z-index:30';
+    document.body.append(load);
+    try {
+      const kit = await loadPoolKit();
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      if (tok !== this.poolTok) return load.remove();
+      await this.buildPool(seed, mp, kit, tok);
+    } catch (e) {
+      console.error('poolrooms', e);
+    }
+    load.remove();
+  }
+
+  private async buildPool(seed: number, mp: Mp, kit: PoolKit, tok: number) {
+    // latas y linternas: los modelos del nivel 0, ya bajados
+    const p = new PoolLevel(this.camera.aspect, this.renderer, seed, { ...kit, water: this.assets?.gltf.water?.scene, flashlight: this.assets?.gltf.flashlight?.scene, camera: this.assets?.gltf.camcorder?.scene }, mp.mission?.kind === 'soaps'), [ox, oz] = startOffset(mp.index ?? 0);
+    p.spawnAt(ox, oz);
+    // el controlador de siempre (manos con IK, linterna, barra rápida, inventario) solo como figura: PoolLevel pone la posición y la física, el Player pone lo que se ve
+    const stub = { root: p.scene, solid: (x: number, z: number) => p.solidAt(x, z), furniture: () => false, voidAt: (x: number, z: number) => p.wetAt(x, z) } as unknown as World; // (la cinta de acordonar solo se tiende en seco)
+    const me = (this.player = new Player(stub, this.assets!, p.camera, this.flash, this.opts.reduced));
+    me.poolMode = true;
+    me.load(mp.inv ?? START_INV);
+    me.onDrink = () => (this.audio?.drink(), mp.sock.emit('drink')); // X con una lata: el servidor da la vida; aquí aguante y cordura
+    // mi cuerpo, manos y objetos van en la capa 1: la cámara los ve, pero la virtual del Reflector del agua (solo capa 0) no los repinta bajo el agua
+    p.camera.layers.enable(1);
+    me.rig.root.traverse((o) => o.layers.set(1));
+    for (const it of Object.values(me.items)) it.traverse((o) => o.layers.set(1));
+    p.camera.add(this.flash, this.flash.target); // la linterna pasa a la cámara del nivel (endPool la devuelve)
+    this.pool = p;
+    this.poolFx(p);
+    await this.renderer.compileAsync(p.scene, p.camera); // los programas de todo el nivel ya (sin congelar el navegador: compile() era síncrono y tardaba segundos)
+    if (tok !== this.poolTok) return;
+    this.mp = mp;
+    const rp = this.composer.passes[0] as RenderPass;
+    rp.scene = p.scene;
+    rp.camera = p.camera;
+    this.flash.intensity = 0;
+    this.vhs.enabled = false;
+    this.mission = mp.mission ?? null;
+    this.audio ??= new GameAudio(undefined, this.muted, this.volume);
+    this.wire(mp);
+    // la cinta de acordonar y el radar (los aliados con «sin señal» no salen)
+    const gd = (this.gadgets = new Gadgets(stub, me, p.camera, this.assets!, this.canvas.parentElement ?? document.body, () => (p.jam > 0 ? [] : [...this.remotes.values()].filter((r) => !(r.jam > 0)))));
+    gd.onTotem = () => this.openTotem();
+    gd.net(mp.sock);
+    // jabones (pickup), tanque, pistola de agua (squirt) y lo que me hacen los demás con ella (wet)
+    p.tank = me.tankWorn;
+    p.claim = (id, done) => mp.sock.emit('pickup', id, (ok: boolean) => (done(ok), ok || (this.note = { text: 'CANNOT TAKE THAT (ALREADY HAVE IT OR TOO FAR)', until: performance.now() + 2000 })));
+    // lo recogido (latas w, linternas f, tanque k, pistola p) pasa a mi inventario local; los jabones no cuentan
+    p.onTake = (id) => {
+      const kind = id[0] === 'd' ? (this.dropKind.get(id) as ItemId | undefined) : ({ w: 'water', f: 'flashlight', c: 'camera', k: 'tank', p: 'watergun' } as const)[id[0] as 'w'];
+      if (!kind) return;
+      me.receive(kind);
+      mp.inv = me.inventory;
+      p.tank = me.tankWorn;
+      p.hasGun = !!mp.inv.watergun;
+    };
+    p.onSquirt = (x, z, yaw) => mp.sock.volatile.emit('squirt', { x, z, yaw });
+    const onWet = (m: { kind: 'wet' | 'stun'; ms: number }) => p.hit(m.kind, m.ms);
+    mp.sock.on('wet', onWet);
+    this.offNet.push(() => mp.sock.off('wet', onWet));
+    this.input.begin();
+    this.audio.start();
+    this.t = 0;
+    this.paused = false;
+    this.clock.start();
+    this.renderer.setAnimationLoop(() => this.frame());
+  }
+  private poolTok = 0;
+  private deadAt = 0;
+  /** Qué es cada objeto soltado (`d…`) que hay en el nivel: los ids no lo dicen. */
+  private dropKind = new Map<string, string>();
+  private poolSend = 0;
+  private sqSnd = 0;
+  /** La barra rápida en las Poolrooms: solo hay una ranura, la pistola de agua (tecla 1 o clic): sacarla o guardarla. */
+  poolHot(i: number) {
+    const p = this.pool, me = this.player;
+    if (!(p instanceof PoolLevel) || !me) return;
+    me.hotSel = i;
+    if (i === 0 && this.mp?.inv?.watergun) {
+      p.gunOn = !p.gunOn;
+      if (p.gunOn) (me.gadget = 'none'), me.hold('none');
+      this.audio?.click();
+    } else (p.gunOn = false), me.useHot(i);
+  }
+  /** Ponerse (o guardar en la mochila) la bombona de buceo. */
+  setTank(on: boolean) {
+    if (!this.player) return;
+    this.player.tankOn = on;
+    this.poolInv();
+  }
+  /** ¿Se está jugando dentro de las Poolrooms con compañeros? (la barra rápida lo usa) */
+  get inPool() {
+    return this.pool instanceof PoolLevel;
+  }
+
+  /** Cada fotograma de una ronda en las Poolrooms: los demás, mi estado a 15 Hz y la salida (con la misión cumplida, al acercarse se sube). */
+  private poolMatch(p: PoolLevel, dt: number, c: Controls): Controls {
+    this.t += dt;
+    const me = this.player, st = p.state;
+    if (!p.dead && !this.winning) {
+      if (c.slot >= 0) this.poolHot(c.slot);
+      else if (c.use) this.poolHot(me?.hotSel ?? 0);
+      if (c.wheel && me) (me.pickHot((me.hotSel + Math.sign(c.wheel) + me.hot.length) % me.hot.length), me.hand !== 'none' && (p.gunOn = false));
+      if (c.drop) this.dropSelected();
+    }
+    if (this.gadgets) c = this.gadgets.update(dt, c); // cinta de acordonar y radar: se llevan los clics que gastan
+    // sonido: pasos en seco o chapoteo (y brazadas al nadar), el zumbido de los tubos y los ruidos lejanos
+    if (st.speed > 0.4 && !st.ride && !p.dead) {
+      this.stepAcc += st.speed * dt;
+      const len = st.swim ? 1.4 : st.speed > 3 ? 1.1 : 0.7;
+      if (this.stepAcc > len) (this.stepAcc -= len), st.wet || st.swim ? this.audio?.wade(st.speed > 3) : this.audio?.step(st.speed > 3);
+    }
+    this.audio?.power(0.6);
+    this.audio?.ambient(dt, 0.7, 0);
+    if (p.dead && !this.spectating && this.t - this.deadAt > 3.5) this.spectate(); // tras caer, a mirar por los ojos de un compañero
+    this.sqSnd -= dt;
+    if (this.cheats.ammo) p.squirtLeft = 1;
+    if ((p.jetting || p.refilling) && this.sqSnd <= 0) (this.sqSnd = p.jetting ? 0.12 : 0.4), p.jetting ? this.audio?.squirt() : this.audio?.refill();
+    for (const r of this.remotes.values()) r.update(dt);
+    this.poolSend += dt;
+    if (this.poolSend >= 1 / 15) (this.poolSend = 0), this.poolState(p);
+    const near = !p.dead && Math.hypot(st.x - p.exit.x, st.z - p.exit.z) < 1.1 && st.y < 1;
+    if (this.mission?.done && near && !this.winning) {
+      this.winning = true;
+      this.mp?.sock.emit('ascend', this.player?.inventory ?? this.mp.inv ?? START_INV); // lo que lleva el Player de verdad (mp.inv solo se refresca al recoger)
+      this.note = { text: 'GOING UP', until: performance.now() + 3000 };
+      setTimeout(() => this.onWin?.(), 2500);
+    } else if (!this.mission?.done && near && performance.now() > this.note.until) this.note = { text: 'THE DOOR IS SEALED · FINISH THE MISSION', until: performance.now() + 2500 };
+    if (this.winning) {
+      this.black = Math.min(1, this.black + dt / 1.5);
+      this.vhs.enabled = true;
+      this.vhs.uniforms.uBlack.value = this.black;
+    }
+    return c;
+  }
+
+  /** Mi estado para la sala (15 Hz y, con la pestaña oculta, el latido de wire). */
+  private poolState(p: PoolLevel) {
+    if (!this.mp || this.spectating) return;
+    const st = p.state;
+    this.mp.sock.volatile.emit('state', { x: st.x, y: st.y, z: st.z, yaw: st.yaw, pitch: st.pitch, anim: 'Neutral Idle', dance: this.player?.dancing || undefined, variant: this.player?.variant || undefined, light: !!this.player?.lightOn, duck: false, tank: !!this.player?.tankWorn, held: 'none', jam: Math.round(p.jam), t: performance.now() });
+  }
+
+  /** El servidor me mata (admin, tótem...): sin mandos, la cámara cae y, pasado un rato, a mirar a los compañeros. */
+  private poolDied(p: PoolLevel) {
+    p.dead = true;
+    p.gunOn = false;
+    this.deadAt = this.t;
+    this.flash.intensity = 0;
+    if (this.bagOpen) this.closeBag();
+    this.note = { text: 'YOU DIED', until: performance.now() + 3500 };
+  }
+  /** Vuelvo a la partida: en el sitio que dice el servidor, con la vista y los mandos de siempre. */
+  private poolRevived(p: PoolLevel, m: { name: string; x: number; y: number; z: number; yaw: number }) {
+    p.dead = false;
+    p.o2 = 1;
+    this.spectating = false;
+    for (const r of this.remotes.values()) r.setFirstPerson(false);
+    this.player?.revive(new THREE.Vector3(m.x, 0, m.z), m.yaw);
+    p.teleport(m.x, m.z, m.yaw, m.y);
+    this.note = { text: 'YOU ARE BACK', until: performance.now() + 4000 };
+  }
+
+  /** Quita el nivel de las Poolrooms (si lo hay) y devuelve el compositor a la escena del juego. */
+  private endPool() {
+    this.poolTok++;
+    const p = this.pool;
+    if (!p) return;
+    this.pool = undefined;
+    this.gadgets?.dispose();
+    this.gadgets = undefined;
+    this.dropKind.clear();
+    this.spectating = false;
+    if (this.player) (this.player.dispose(), (this.player = undefined), this.camera.add(this.flash, this.flash.target)); // la linterna vuelve a la cámara del juego
+    this.poolFx();
+    p.dispose();
+    const rp = this.composer.passes[0] as RenderPass;
+    rp.scene = this.scene;
+    rp.camera = this.camera;
+    this.vhs.enabled = false;
+    this.vhs.uniforms.uBlack.value = 0;
+    this.poolStat?.el.remove();
+    for (const r of this.remotes.values()) (r.root.removeFromParent(), this.spare.push(r));
+    this.remotes.clear();
+  }
+
+  /** Desarrollo (`?runlevel`): el nivel sin sala ni compañeros. */
+  devRun() {
+    this.beginRun();
+    this.run!.onDone = () => console.info('run level: done');
+    this.input.begin();
+    this.clock.start();
+    this.renderer.setAnimationLoop(() => this.frame());
+  }
+
+  // ── consola de admin ─────────────────────────────────────────────────────
+  // Aquí solo lo que es de este cliente (o de la partida en solitario). Lo que toca a la sala lo decide el servidor (`admin` en server/src/index.ts)
+  // y llega por los canales de siempre más `adminFx` (teletransporte, objeto, curación).
+
+  /** Efecto que manda el servidor a este jugador. */
+  adminFx(fx: AdminFx) {
+    const p = this.player, pl = this.pool instanceof PoolLevel ? this.pool : undefined;
+    if (fx.k === 'ammo') return void (this.cheats.ammo = fx.on); // (el servidor lo ordena a este cliente: también si está muerto)
+    if (!p || p.dead) return;
+    if (fx.k === 'tp') pl ? pl.teleport(fx.x, fx.z, fx.yaw, fx.y) : p.spawn(new THREE.Vector3(fx.x, 0, fx.z), fx.yaw);
+    else if (fx.k === 'give') (p.receive(fx.item), this.poolInv());
+    else ((p.hp = HP_MAX), (p.stamina = 1), (p.sanity = 1), pl && (pl.o2 = 1));
+  }
+
+  /** Trucos propios: velocidad x2, atravesar paredes, sin luz (y, solo, inmortal). Devuelve el estado nuevo. */
+  adminToggle(op: 'speed' | 'noclip' | 'light' | 'god', on: boolean) {
+    if (!this.adminOk) return;
+    const p = this.player;
+    if (op === 'god') this.god = on;
+    if (op === 'light' && this.world) (this.lightsOff = !on), (this.world.power = on ? 1 : 0), (this.outT = -1);
+    if (op === 'speed') this.cheats.speed = on ? 2 : 1;
+    if (p && op === 'noclip') p.noclip = on;
+  }
+
+  /** Trucos con valor: velocidad/salto (multiplicadores), cámara lenta, cordura y aguante infinitos, luz total. */
+  adminCheat(op: 'speed' | 'jump' | 'slow', v: number): void;
+  adminCheat(op: 'stamina' | 'sanity' | 'bright' | 'ammo', v: boolean): void;
+  adminCheat(op: 'speed' | 'jump' | 'slow' | 'ammo' | 'stamina' | 'sanity' | 'bright', v: number | boolean) {
+    if (!this.adminOk) return;
+    if (op === 'bright') {
+      this.cheats.bright = !!v;
+      if (v && !this.brightLight) (this.brightLight = new THREE.HemisphereLight(0xffffff, 0x9aa090, 1.6)), this.scene.add(this.brightLight);
+    } else (this.cheats as Record<string, number | boolean>)[op] = v;
+  }
+
+  /** Lo que el panel enseña como activo (el juego puede haberlo reiniciado: nueva partida, nuevo jugador). */
+  adminState() {
+    return { ...this.cheats, noclip: !!this.player?.noclip, light: !this.lightsOff, god: this.god };
+  }
+
+  /** Marcadores de posición: dónde estoy / ir a un sitio guardado (solo en solitario: en una sala el servidor manda la posición). */
+  adminPos() {
+    const p = this.player;
+    return p ? { x: p.pos.x, z: p.pos.z, yaw: p.yaw } : null;
+  }
+  adminGoto(m: { x: number; z: number; yaw: number }) {
+    if (!this.adminOk) return;
+    if (!this.mp) this.player?.spawn(new THREE.Vector3(m.x, 0, m.z), m.yaw);
+  }
+
+  /**
+   * Captura de lo que se ve (sin el panel) al portapapeles, con la semilla y la posición exactas como texto. Devuelve ese texto.
+   * Sin contexto seguro (http por IP) no hay portapapeles de imágenes: baja el PNG y copia solo el texto.
+   */
+  async adminShot() {
+    const pl = this.pool instanceof PoolLevel ? this.pool : undefined, p = this.player;
+    const s = pl ? pl.state : p ? { x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: p.yaw, pitch: 0 } : { x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
+    const seed = pl ? pl.seed : this.seed0, f = (n: number) => n.toFixed(3);
+    const txt = `seed ${seed}  level ${this.mp?.level ?? (pl ? 'poolrooms' : 'level0')}
+x ${f(s.x)}  y ${f(s.y)}  z ${f(s.z)}  yaw ${f(s.yaw)}  pitch ${f(s.pitch)}`;
+    this.composer.render(0);
+    const png = new Promise<Blob>((ok, no) => this.renderer.domElement.toBlob((b) => (b ? ok(b) : no(new Error('toBlob'))), 'image/png'));
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': png, 'text/plain': new Blob([txt], { type: 'text/plain' }) })]);
+    } catch {
+      const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(await png), download: `backrooms-${seed}.png` }), t = Object.assign(document.createElement('textarea'), { value: txt });
+      a.click(), URL.revokeObjectURL(a.href);
+      document.body.append(t), t.select(), document.execCommand('copy'), t.remove();
+    }
+    return txt;
+  }
+
+  /** Interruptores de rendimiento de las Poolrooms (para ver qué pasada pesa): AO, SMAA y sombra del sol. Devuelve el estado. */
+  adminPerf(k?: 'ao' | 'smaa' | 'sun') {
+    if (!this.adminOk) return { ao: false, smaa: false, sun: false };
+    const pl = this.pool instanceof PoolLevel ? this.pool : undefined, fx = this.fx;
+    if (k === 'ao' && fx) fx.ao.enabled = !fx.ao.enabled;
+    if (k === 'smaa' && fx) fx.smaa.enabled = !fx.smaa.enabled;
+    if (k === 'sun' && pl) pl.sun.castShadow = !pl.sun.castShadow;
+    return { ao: !!fx?.ao.enabled, smaa: !!fx?.smaa.enabled, sun: !!pl?.sun.castShadow };
+  }
+
+  /** Solo: regenerar el mapa con otra semilla (el nivel actual). */
+  adminLevel0(seed = (Math.random() * 2 ** 31) | 0) {
+    if (!this.adminOk) return;
+    this.start(seed);
+  }
+
+  /** Solo: «Run for your life» en medio de la partida (o sin ella): al llegar a la meta se vuelve. */
+  adminRun() {
+    if (!this.adminOk) return;
+    if (this.run) return;
+    this.beginRun();
+    const r = this.run as RunLevel | undefined; // (beginRun la crea: TS no lo sabe)
+    if (r) r.onDone = r.onFail = () => this.endRun();
+    if (!this.player) (this.input.begin(), this.clock.start(), this.renderer.setAnimationLoop(() => this.frame()));
+  }
+
+  /** Solo: curar, matar, completar la misión, teletransportarse, objetos y entidades. */
+  adminSolo(op: 'heal' | 'kill' | 'mission' | 'tvs' | 'start' | 'elevator' | 'spawn' | 'clear' | 'freeze' | 'thaw' | { item: ItemId }) {
+    if (!this.adminOk) return;
+    const p = this.player, w = this.world;
+    if (!p || !w) return;
+    if (op === 'heal') (p.hp = HP_MAX), (p.stamina = 1), (p.sanity = 1);
+    else if (op === 'kill') this.die();
+    else if (op === 'mission') {
+      const m = this.mission;
+      if (m && !m.done) (m.done = true), (m.progress = m.goal), this.missionDone();
+    } else if (op === 'tvs') this.tvs?.sync([...Array(this.mission?.goal ?? 0).keys()], this.audio);
+    else if (op === 'start' || op === 'elevator') p.spawn(center(op === 'start' ? w.maze.start : w.maze.elevator), p.yaw);
+    else if (op === 'spawn') {
+      const m = w.maze, e = new Entity(Math.random() < 0.5 ? 'bacteria' : 'partygoer', w, this.assets!, m.spawns[(Math.random() * m.spawns.length) | 0] ?? m.spawns[0]);
+      this.entities.push(e);
+      this.items!.targets = this.entities;
+    } else if (op === 'clear') (this.entities.forEach((e) => e.dispose()), (this.entities = []), (this.items!.targets = this.entities));
+    else if (op === 'freeze' || op === 'thaw') this.entFrozen = op === 'freeze';
+    else if (canHold(p.inventory, op.item)) p.receive(op.item);
+  }
+
+  /** Solo: lo que enseña el panel de depuración. */
+  adminInfo() {
+    const m = this.mission;
+    return { level: 'level0', seed: this.seed0, t: Math.round(this.t), ents: this.entities.filter((e) => e.alive).length, mission: m ? `${m.text} ${m.progress}/${m.goal}${m.done ? ' DONE' : ''}` : '-', hp: Math.round(this.player?.hp ?? 0), rtt: netStats.rtt };
+  }
+
   /** Saca al jugador de la partida (la sala vuelve al lobby): se para todo y queda el lienzo en negro. */
   stop() {
     this.renderer.setAnimationLoop(null);
+    this.endRun();
+    this.endPool();
+    this.totemOpen = false;
     this.leaveWaiting();
     this.stopMp();
     this.input.active = false;
@@ -1291,6 +2321,11 @@ export class BackroomsGame {
     this.audio = undefined;
     this.player?.dispose();
     this.world?.dispose();
+    this.gadgets?.dispose();
+    this.gadgets = undefined;
+    this.tvs?.dispose();
+    this.tvs = undefined;
+    this.mission = this.ascent = null;
     this.player = this.world = this.items = undefined;
     this.spectating = false;
     this.dying = -1;
@@ -1307,6 +2342,7 @@ export class BackroomsGame {
 
   dispose() {
     this.renderer.setAnimationLoop(null);
+    this.endRun();
     this.stopMp();
     this.spare.forEach((r) => r.dispose());
     for (const off of this.offs) off();
@@ -1318,6 +2354,8 @@ export class BackroomsGame {
     this.snap?.dispose();
     this.audio?.dispose();
     this.composer.dispose();
+    this.gadgets?.dispose();
+
     this.player?.dispose();
     this.world?.dispose();
     this.renderer.dispose();

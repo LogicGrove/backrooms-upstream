@@ -49,6 +49,13 @@ const MIGRATIONS = [
      head TEXT NOT NULL DEFAULT '',
      back TEXT NOT NULL DEFAULT ''
    );`,
+  // foto de perfil: una por cuenta (webp o jpeg ya validado), aparte de users para no cargar el blob en cada consulta
+  `CREATE TABLE avatars (
+     user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+     mime TEXT NOT NULL,
+     data BLOB NOT NULL,
+     updated_at INTEGER NOT NULL
+   );`,
 ];
 const version = Number(db.prepare('PRAGMA user_version').get()?.user_version ?? 0);
 for (let v = version; v < MIGRATIONS.length; v++) {
@@ -150,7 +157,21 @@ export function bumpStat(id: number, key: StatKey, by = 1) {
 export function loadoutOf(id: number): Look {
   return cleanLook(q.loadout.get(id));
 }
-export const saveLoadout = (id: number, l: Look) => void q.setLoadout.run(id, l.color, l.head, l.back);
+
+// foto de perfil
+const qa = {
+  get: db.prepare('SELECT mime, data, updated_at FROM avatars WHERE user_id = ?'),
+  ver: db.prepare('SELECT updated_at FROM avatars WHERE user_id = ?'),
+  set: db.prepare('INSERT INTO avatars (user_id, mime, data, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET mime = excluded.mime, data = excluded.data, updated_at = excluded.updated_at'),
+  del: db.prepare('DELETE FROM avatars WHERE user_id = ?'),
+};
+export const avatarOf = (id: number) => qa.get.get(id) as unknown as { mime: string; data: Uint8Array; updated_at: number } | undefined;
+/** El valor de `avatar` en Me y Member: `<id>?v=<versión>`, o vacío si no tiene foto. */
+export const avatarRef = (id: number) => (id && qa.ver.get(id) ? `${id}?v=${qa.ver.get(id)!.updated_at}` : '');
+export const saveAvatar = (id: number, mime: string, data: Uint8Array) => void qa.set.run(id, mime, data, Date.now());
+export const deleteAvatar = (id: number) => void qa.del.run(id);
+
+export const saveLoadout =(id: number, l: Look) => void q.setLoadout.run(id, l.color, l.head, l.back);
 
 // OJO: los statements solo guardan una referencia débil a la base; si nada más la retiene, el GC la cierra y fallan ("statement has been finalized")
 export const database = db;

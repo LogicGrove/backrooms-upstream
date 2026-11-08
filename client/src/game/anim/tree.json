@@ -1,0 +1,212 @@
+{
+  "params": {
+    "speed": 0,
+    "crouch": 0,
+    "air": 0,
+    "vy": 0,
+    "hold": 0
+  },
+  "slots": {
+    "idle": "Idle",
+    "walk": "Walking",
+    "run": "Slow Run",
+    "sprint": "Running",
+    "crouchIdle": "Crouching",
+    "crouchWalk": "Crouched Walking",
+    "jump": "Jump",
+    "fall": "Falling",
+    "toCrouch": "Standing To Crouched",
+    "toStand": "Crouch To Stand"
+  },
+  "root": {
+    "type": "layer",
+    "mask": "upper",
+    "weight": {
+      "p": "hold"
+    },
+    "over": {
+      "type": "clip",
+      "clip": "$idle",
+      "freeze": 0
+    },
+    "base": {
+      "type": "machine",
+      "entry": "ground",
+      "states": [
+        {
+          "name": "ground",
+          "node": {
+            "type": "blend1d",
+            "param": "speed",
+            "fit": true,
+            "items": [
+              {
+                "at": 0,
+                "node": {
+                  "type": "clip",
+                  "clip": "$idle"
+                }
+              },
+              {
+                "at": 1.6,
+                "node": {
+                  "type": "clip",
+                  "clip": "$walk"
+                }
+              },
+              {
+                "at": 3.6,
+                "node": {
+                  "type": "clip",
+                  "clip": "$run"
+                }
+              },
+              {
+                "at": 5.5,
+                "node": {
+                  "type": "clip",
+                  "clip": "$sprint"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "crouch",
+          "node": {
+            "type": "blend1d",
+            "param": "speed",
+            "fit": true,
+            "items": [
+              {
+                "at": 0,
+                "node": {
+                  "type": "clip",
+                  "clip": "$crouchIdle"
+                }
+              },
+              {
+                "at": 1.1,
+                "node": {
+                  "type": "clip",
+                  "clip": "$crouchWalk"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "name": "jump",
+          "node": {
+            "type": "clip",
+            "clip": "$jump",
+            "loop": false
+          }
+        },
+        {
+          "name": "fall",
+          "node": {
+            "type": "clip",
+            "clip": "$fall"
+          }
+        }
+      ],
+      "transitions": [
+        {
+          "from": "jump",
+          "to": "fall",
+          "when": [
+            {
+              "p": "vy",
+              "op": "<",
+              "v": 0
+            }
+          ],
+          "fade": 0.15
+        },
+        {
+          "from": "jump",
+          "to": "ground",
+          "when": [
+            {
+              "p": "air",
+              "op": "==",
+              "v": 0
+            }
+          ],
+          "fade": 0.12
+        },
+        {
+          "from": "fall",
+          "to": "ground",
+          "when": [
+            {
+              "p": "air",
+              "op": "==",
+              "v": 0
+            }
+          ],
+          "fade": 0.12
+        },
+        {
+          "from": "ground",
+          "to": "jump",
+          "when": [
+            {
+              "p": "air",
+              "op": "==",
+              "v": 1
+            },
+            {
+              "p": "vy",
+              "op": ">",
+              "v": 0.5
+            }
+          ],
+          "fade": 0.1
+        },
+        {
+          "from": "ground",
+          "to": "fall",
+          "when": [
+            {
+              "p": "air",
+              "op": "==",
+              "v": 1
+            },
+            {
+              "p": "vy",
+              "op": "<=",
+              "v": 0.5
+            }
+          ],
+          "fade": 0.2
+        },
+        {
+          "from": "ground",
+          "to": "crouch",
+          "when": [
+            {
+              "p": "crouch",
+              "op": "==",
+              "v": 1
+            }
+          ],
+          "fade": 0.25
+        },
+        {
+          "from": "crouch",
+          "to": "ground",
+          "when": [
+            {
+              "p": "crouch",
+              "op": "==",
+              "v": 0
+            }
+          ],
+          "fade": 0.25
+        }
+      ]
+    }
+  }
+}

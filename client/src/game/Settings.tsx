@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import Frame from './Frame';
 import { Crosshair } from './Crosshair';
 import { DEFAULTS, setSetting, useSettings, type Settings } from '../settings';
@@ -20,7 +20,7 @@ interface Row {
   long: string; // el panel de la derecha
   note?: string;
   num?: { k: NumKey; min: number; max: number; step: number; unit: string; scale: number };
-  flag?: BoolKey | 'mute';
+  flag?: BoolKey | 'mute' | 'fullscreen';
 }
 
 const pct = (k: NumKey): Row['num'] => ({ k, min: 0, max: 1, step: 0.05, unit: '%', scale: 100 });
@@ -38,6 +38,9 @@ const SECTIONS = {
   ],
   VIDEO: [
     { id: 'vhs', label: 'VHS EFFECT', desc: 'Tape noise, bleed and tracking', long: 'How much the tape shows through when you look through the camera, die or take the elevator. At 0 the picture is clean; a corrupted tape always shows.', num: pct('vhs') },
+    { id: 'fullscreen', label: 'FULLSCREEN', desc: 'Fill the whole screen', long: 'Switches the browser to fullscreen and back. Leaving it with Esc pauses the game, as always.', flag: 'fullscreen' },
+    { id: 'resScale', label: 'RESOLUTION SCALE', desc: 'Lower is faster', long: 'How many pixels the game draws, as a share of the screen. Lowering it makes the picture softer and gives back frames on a slow computer.', num: { k: 'resScale', min: 0.5, max: 1, step: 0.05, unit: '%', scale: 100 } },
+    { id: 'brightness', label: 'BRIGHTNESS', desc: 'Lift or darken the picture', long: 'Brightens or darkens the whole picture. The Backrooms are meant to be dim: raise it only if you cannot see.', num: { k: 'brightness', min: 0.6, max: 1.6, step: 0.05, unit: '%', scale: 100 } },
     { id: 'fov', label: 'FIELD OF VIEW', desc: 'How much you see', long: 'The vertical angle of the lens. Wider shows more of the room and bends the edges.', num: { k: 'fov', min: 60, max: 110, step: 5, unit: '°', scale: 1 } },
     { id: 'crosshair', label: 'CROSSHAIR', desc: 'A dot at the centre', long: 'A small dot in the middle of the picture so you can tell where you are looking. It hides when you aim through the camera or the rifle, hide in a niche or open the bag.', flag: 'crosshair' },
     { id: 'fps', label: 'SHOW FPS', desc: 'A frame counter, top right', long: 'Shows how many frames per second the game is drawing, on every screen.', flag: 'fps' },
@@ -101,6 +104,11 @@ function Preview({ row, s, muted }: { row: Row; s: Settings; muted: boolean }): 
         </svg>
       );
     }
+    case 'resScale':
+    case 'brightness':
+      return <p className="br-big">{Math.round(s[row.id] * 100)}%</p>;
+    case 'fullscreen':
+      return <p className="br-big">{document.fullscreenElement ? 'FULLSCREEN' : 'WINDOWED'}</p>;
     case 'crosshair':
       return (
         <p className="br-big">
@@ -121,9 +129,15 @@ export default function SettingsPane({ muted, toggleSound, onBack }: { muted: bo
   const [tab, setTab] = useState<Section>('AUDIO');
   const [pick, setPick] = useState<Record<string, string>>({});
   const s = useSettings();
+  const [full, setFull] = useState(!!document.fullscreenElement);
+  useEffect(() => {
+    const f = () => setFull(!!document.fullscreenElement);
+    document.addEventListener('fullscreenchange', f);
+    return () => document.removeEventListener('fullscreenchange', f);
+  }, []);
   const rows: Row[] = SECTIONS[tab];
   const row = rows.find((r) => r.id === pick[tab]) ?? rows[0];
-  const keys = rows.flatMap((r) => (r.num ? [r.num.k] : r.flag && r.flag !== 'mute' ? [r.flag] : []));
+  const keys = rows.flatMap((r) => (r.num ? [r.num.k] : r.flag && r.flag !== 'mute' && r.flag !== 'fullscreen' ? [r.flag] : []));
   const reset = (ks: (keyof Settings)[]) => ks.forEach((k) => setSetting(k, DEFAULTS[k] as never));
 
   return (
@@ -140,7 +154,7 @@ export default function SettingsPane({ muted, toggleSound, onBack }: { muted: bo
           }}
         >
           {rows.map((r) => {
-            const f = r.flag, on = f === 'mute' ? muted : f ? s[f] : false;
+            const f = r.flag, on = f === 'mute' ? muted : f === 'fullscreen' ? full : f ? s[f] : false;
             return (
               <li key={r.id} className="br-row" data-sel={r === row || undefined} onMouseEnter={() => setPick({ ...pick, [tab]: r.id })} onFocus={() => setPick({ ...pick, [tab]: r.id })}>
                 <span className="br-row__l">
@@ -156,7 +170,7 @@ export default function SettingsPane({ muted, toggleSound, onBack }: { muted: bo
                     <output className="br-row__v">{show(r.num, s[r.num.k])}</output>
                   </span>
                 ) : (
-                  <button type="button" className="br-opt br-row__sw" role="switch" aria-checked={on} aria-label={r.label} onClick={() => (f === 'mute' ? toggleSound() : f && setSetting(f, !s[f]))}>
+                  <button type="button" className="br-opt br-row__sw" role="switch" aria-checked={on} aria-label={r.label} onClick={() => (f === 'mute' ? toggleSound() : f === 'fullscreen' ? void (document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen()).catch(() => {}) : f && setSetting(f, !s[f]))}>
                     {on ? 'ON' : 'OFF'}
                   </button>
                 )}

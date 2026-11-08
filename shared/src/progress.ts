@@ -5,10 +5,16 @@
 
 // ── cuentas ──────────────────────────────────────────────────────────────
 export const USER_RE = /^[A-Za-z0-9_]{3,16}$/;
+/** La única cuenta con consola de admin (nombre exacto, ver server/src/index.ts: la comprobación real es del servidor). */
+export const ADMIN_USER = 's7lver';
 export const PASS_MIN = 8;
 export const PASS_MAX = 128;
 /** Lo que el servidor acepta de cuerpo en la API (bytes). */
 export const BODY_MAX = 4096;
+/** La foto de perfil: bytes máximos, lado (px) y tipos permitidos (nada de SVG). */
+export const AVATAR_MAX = 40 * 1024;
+export const AVATAR_PX = 128;
+export const AVATAR_TYPES = ['image/webp', 'image/jpeg'];
 
 // ── logros ───────────────────────────────────────────────────────────────
 /** Contadores de progreso (los lleva el servidor por cuenta). */
@@ -99,6 +105,10 @@ export function cleanLook(x: unknown): Look {
 // ── lo que devuelve la API ───────────────────────────────────────────────
 export interface Me {
   username: string;
+  /** Es la cuenta de admin (solo para MOSTRAR la consola: el servidor vuelve a comprobarlo en cada acción). */
+  admin?: boolean;
+  /** Su foto de perfil (`<id>?v=<versión>`), vacío si no tiene. */
+  avatar: string;
   /** clave → cuándo (ms). */
   achievements: Record<string, number>;
   stats: Partial<Record<StatKey, number>>;

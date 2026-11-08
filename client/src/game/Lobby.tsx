@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { NAME_MAX, type Difficulty, type Joined, type RoomInfo } from '@backrooms/shared';
+import { DIFFICULTY, NAME_MAX, type Difficulty, type Joined, type RoomInfo } from '@backrooms/shared';
 import type { Net, Link, Server } from '../net';
 import { DIFF } from './RoomSettings';
 
@@ -124,7 +124,8 @@ export default function Lobby({ net, onSolo, server, error, account }: { net: Ne
 
   // con sala, lo que se ve es la sala de espera (3D): esto solo dura el fotograma del cambio
   if (room) return null;
-  const create = (pub: boolean) => sock!.emit('create', { name: nick, public: pub }, joined);
+  const [pick, setPick] = useState<boolean | null>(null); // el aviso para elegir la dificultad de la sala nueva (true: pública)
+  const create = (pub: boolean, difficulty: Difficulty) => (setPick(null), sock!.emit('create', { name: nick, public: pub, difficulty }, joined));
   return (
     <div className="br-pane br-pane--rooms" role="region" aria-label="Rooms" tabIndex={-1} ref={pane} onKeyDown={onKey}>
       <div className="br-toolbar">
@@ -198,10 +199,10 @@ export default function Lobby({ net, onSolo, server, error, account }: { net: Ne
         <button type="button" className="br-opt" disabled={!ready} onClick={quick}>
           QUICK JOIN
         </button>
-        <button type="button" className="br-opt" disabled={!ready} onClick={() => create(true)}>
+        <button type="button" className="br-opt" disabled={!ready} onClick={() => setPick(true)}>
           NEW PUBLIC ROOM
         </button>
-        <button type="button" className="br-opt" disabled={!ready} onClick={() => create(false)}>
+        <button type="button" className="br-opt" disabled={!ready} onClick={() => setPick(false)}>
           NEW PRIVATE ROOM
         </button>
         <button type="button" className="br-opt" onClick={onSolo}>
@@ -222,6 +223,39 @@ export default function Lobby({ net, onSolo, server, error, account }: { net: Ne
         </form>
         <span className="br-lobby__dim br-lobby__keys">↑ ↓ SELECT · ENTER JOIN</span>
       </div>
+      {pick !== null && (
+        <aside className="br-board" role="dialog" aria-label="Room difficulty" onKeyDown={(e) => e.key === 'Escape' && setPick(null)}>
+          <p className="br-board__bar">
+            <span>ROOM DIFFICULTY</span>
+            <span className="br-lobby__dim">{pick ? 'PUBLIC' : 'PRIVATE'} ROOM</span>
+            <button type="button" className="br-opt" autoFocus onClick={() => setPick(null)}>CANCEL</button>
+          </p>
+          <p className="br-lobby__dim br-board__sub">PICK HOW HARD IT IS. IT SETS THE MONEY YOU EARN, THE LOOT ON THE MAP AND HOW MANY ENTITIES START. THE OWNER CAN CHANGE IT LATER IN THE ROOM SETTINGS.</p>
+          <ul className="br-board__grid">
+            {(Object.keys(DIFFICULTY) as Difficulty[]).map((d, i) => {
+              const D = DIFFICULTY[d];
+              return (
+                <li key={d}>
+                  <button type="button" className="br-tile" data-lead={d === 'normal' || undefined} onClick={() => create(pick, d)}>
+                    <span className="br-tile__top">
+                      <span className="br-lobby__dim">{String(i + 1).padStart(2, '0')}</span>
+                      <span className="br-tile__tag">{d === 'normal' ? 'DEFAULT' : ''}</span>
+                    </span>
+                    <b className="br-tile__t">{DIFF[d]}</b>
+                    <span className="br-tile__pay"><span className="br-lobby__dim">MONEY</span> x{D.money}</span>
+                    <span className="br-tile__votes" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>
+                      <span>LOOT {Math.round(D.loot * 100)}%</span>
+                      <span>{D.ents} ENTIT{D.ents === 1 ? 'Y' : 'IES'} AT THE START</span>
+                      <span>ENTITY SPEED x{D.speed}</span>
+                      <span>{D.life}S OF FLASHLIGHT</span>
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </aside>
+      )}
     </div>
   );
 }

@@ -1,10 +1,13 @@
 import * as THREE from 'three';
 import { DEFAULT_LOOK, type Look, type PlayerState } from '@backrooms/shared';
 import type { Assets } from './game';
-import { Rig, aim } from './rig';
+import { Rig } from './rig';
+import { build } from './anim/core';
 import { fit } from './player';
 import { Cosmetics } from './cosmetics';
 import { Timeline, Track, type Snap } from './interp';
+import { poolPart } from './poolmap';
+import { worn, wornModel, placeWorn } from './worn';
 
 /*
  * Otro jugador: el mismo hazmat (clonado) que el propio, con la linterna y lo que lleve en la mano. Se
@@ -12,7 +15,9 @@ import { Timeline, Track, type Snap } from './interp';
  * luz recompilaría todos los materiales): el haz de la linterna es un cono aditivo.
  */
 
-const WALK = 1.6, RUN = 3.6;
+/** La muerte y los emotes de la sala de espera (1–4) son clips del paquete de animaciones (anim/): saludar, señalar, puño en alto y sentarse (agachado). */
+const DEATH = 'Standing React Death Backward';
+const EMOTES = ['', 'Cheering', 'Pointing', 'Fist Pump', 'Crouching'];
 const _v = new THREE.Vector3(), _q = new THREE.Quaternion(), _e = new THREE.Euler();
 const angle = (a: number, b: number) => a + THREE.MathUtils.euclideanModulo(b - a + Math.PI, Math.PI * 2) - Math.PI;
 
@@ -69,6 +74,8 @@ export class Remote {
   private rig: Rig;
   private cos: Cosmetics;
   private items: Record<'flashlight' | 'camera' | 'gun', THREE.Object3D>;
+  /** La bombona del traje de buzo, a la espalda (las Poolrooms; se crea cuando llega el estado con `tank`). */
+  private tank?: THREE.Object3D;
   private beam = new THREE.Group();
   private beamMats = [beamMat(0.07), beamMat(0.16)];
   private glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: GLOW, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
@@ -80,11 +87,14 @@ export class Remote {
   yaw = 0;
   pitch = 0;
   light = true;
+  /** Poolrooms: ms de «sin señal» del radar que declara este jugador. */
+  jam = 0;
   held: PlayerState['held'] = 'none';
   dead = false;
   /** Escondido en un nicho: se ve agachado dentro (el cuerpo achatado y echado hacia el fondo). */
   hiding = false;
   private crouch = 0;
+  private wantTank = false;
   id = '';
   name = '';
   private goal = new THREE.Vector3();
@@ -98,7 +108,10 @@ export class Remote {
   private deadT = 0;
   // la sala de espera: emote (ver PlayerState.emote), sombra falsa y pasos
   emote = 0;
-  private emoteK = 0;
+  private duck = false;
+  /** Baile de victoria que baila (id de anim/dances.json). */
+  dancing = '';
+  private emoting = 0;
   floorShadow = false;
   private shadow = new THREE.Mesh(new THREE.PlaneGeometry(0.95, 0.95).rotateX(-Math.PI / 2), new THREE.MeshBasicMaterial({ map: BLOB, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2 }));
   onStep?: (r: Remote, run: boolean) => void;
@@ -106,6 +119,7 @@ export class Remote {
 
   constructor(assets: Assets) {
     this.rig = new Rig(assets.gltf.hazmat);
+    this.rig.useAnimator();
     this.rig.root.traverse((o) => void ((o as THREE.Mesh).isMesh && (o.castShadow = true)));
     this.cos = new Cosmetics(this.rig.root);
     this.items = {
@@ -130,7 +144,6 @@ export class Remote {
     this.label = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false }));
     this.label.scale.set(1, 0.25, 1);
     this.root.add(this.rig.root, ...Object.values(this.items), this.beam, this.glow, this.label, this.shadow, this.cos.root);
-    this.rig.play('Neutral Idle', 0);
   }
 
   /** Reutilizar este clon para otro jugador. */
@@ -147,7 +160,8 @@ export class Remote {
     this.deadT = 0;
     this.cos.set(DEFAULT_LOOK);
     this.rig.root.rotation.set(0, 0, 0);
-    this.rig.play('Neutral Idle', 0);
+    this.rig.animator?.stopOver();
+    this.emoting = 0;
     const x = this.labelCtx;
     x.clearRect(0, 0, 256, 64);
     x.font = 'bold 30px ui-monospace, Consolas, monospace';
@@ -183,8 +197,16 @@ export class Remote {
     if (this.dead) return;
     this.dead = true;
     this.deadT = 0;
-    const clip = ['Dying', 'Falling Back Death', 'Death'].find((n) => this.rig.action(n));
-    if (clip) this.rig.play(clip, 0.1, true);
+    this.rig.animator?.playOver(build({ type: 'clip', clip: DEATH, loop: false }), { fadeIn: 0.1, hold: true });
+  }
+
+  /** Vuelve a la partida (el Tótem de la vida): de pie otra vez, en el sitio que diga el siguiente estado. */
+  revive() {
+    this.dead = false;
+    this.deadT = 0;
+    this.fresh = true;
+    this.track = new Track();
+    this.base = undefined;
   }
 
   /** La cabeza se esconde mientras se mira por sus ojos. */
@@ -201,16 +223,32 @@ export class Remote {
       this.goalYaw = this.out.yaw;
       this.goalPitch = this.out.pitch;
       this.light = s.light;
+      this.jam = Math.max(0, (s.jam ?? 0) - this.track.tl.delay); // su «sin señal» menos lo que ya tiene el paquete
       this.held = s.held;
       this.hiding = !!s.hiding;
+      this.wantTank = !!s.tank;
       this.emote = s.emote ?? 0;
-      if (!this.dead) this.rig.play(s.anim);
+      this.duck = !!s.duck;
+      const A = this.rig.animator;
+      if (A) {
+        if ((s.variant ?? '') !== A.variant) A.setVariant(s.variant ?? '');
+        if (!this.dead && !this.dancing && this.emote !== this.emoting) {
+          this.emoting = this.emote;
+          if (this.emote) A.playOverClip(EMOTES[this.emote], 1);
+          else A.stopOver();
+        }
+        if ((s.dance ?? '') !== this.dancing) {
+          this.dancing = s.dance ?? '';
+          if (this.dancing) A.playOver(this.dancing, { hold: true });
+          else A.stopOver();
+        }
+      }
       if (this.fresh) (this.fresh = false), this.pos.copy(this.goal), (this.yaw = this.goalYaw), (this.pitch = this.goalPitch);
     }
     // ya viene suave: solo un pulido corto (y, si de verdad se ha ido lejos, se corta)
     const k = 1 - Math.exp(-dt * 30), prev = _v.copy(this.pos);
     Timeline.follow(this.pos, this.goal, dt, k); // con tope de velocidad: tras un atasco se recupera corriendo, no a saltos
-    this.pos.y += (this.goal.y - this.pos.y) * k;
+    this.pos.y += (this.goal.y - this.pos.y) * (Math.abs(this.goal.y - this.pos.y) > 3 ? 1 : k); // (un teletransporte o una caída de planta: sin deslizar)
     // la mirada (cabeza) con un filtro más lento y tope de velocidad: el ratón de quien juega tiembla y a veces da
     // saltos, y la cabeza no debe latiguear ni vibrar con eso
     const kh = 1 - Math.exp(-dt * 12), cap = dt * 12;
@@ -219,8 +257,15 @@ export class Remote {
     // el clip, a la velocidad a la que se mueve de verdad
     const sp = dt > 0 ? this.pos.distanceTo(prev) / dt : 0;
     this.speed += (sp - this.speed) * Math.min(1, dt * 8);
-    const a = this.rig.current;
-    if (a && !this.dead) a.timeScale = this.speed > 0.2 ? THREE.MathUtils.clamp(this.speed / (this.speed > 2.4 ? RUN : WALK), 0.6, 1.4) : 1;
+    const A = this.rig.animator;
+    if (A) {
+      // los parámetros del árbol: la velocidad a la que se mueve de verdad (los pasos casan solos) y el resto, de su último estado
+      A.p.speed = this.speed > 0.15 ? this.speed : 0;
+      A.p.crouch = this.duck ? 1 : 0;
+      A.p.air = Math.abs(this.goal.y - this.pos.y) > 0.4 ? 1 : 0;
+      A.p.vy = this.goal.y - this.pos.y;
+      A.p.hold += ((this.held !== 'none' || this.light) && !this.dancing ? 1 - A.p.hold : -A.p.hold) * Math.min(1, dt * 12);
+    }
     const body = this.rig.root;
     body.position.copy(this.pos);
     this.crouch += ((this.hiding && !this.dead ? 1 : 0) - this.crouch) * Math.min(1, dt * 8);
@@ -229,17 +274,23 @@ export class Remote {
     body.position.z += Math.cos(this.yaw) * 0.3 * this.crouch;
     if (this.dead) {
       this.deadT += dt;
-      const clip = ['Dying', 'Falling Back Death', 'Death'].find((n) => this.rig.action(n));
       body.rotation.set(0, this.yaw + Math.PI, 0);
-      if (!clip) body.rotation.set(-(Math.min(1, this.deadT / 0.75) ** 2) * (Math.PI / 2) * 0.96, this.yaw + Math.PI, 0, 'YXZ');
     } else body.rotation.set(0, this.yaw + Math.PI, 0);
     this.rig.update(dt);
-    if (!this.dead) this.pose(dt);
     // la cabeza sigue a la mirada (hacia arriba o abajo)
     if (this.bones.Head && !this.dead) this.bones.Head.rotation.x -= THREE.MathUtils.clamp(this.pitch, -1, 1) * 0.7;
     body.updateMatrixWorld(true);
     this.cos.update(this.pitch, !this.bones.Head || this.bones.Head.scale.x > 0.5);
     const live = !this.dead;
+    if (this.wantTank && !this.tank && poolPart('tank')) {
+      this.tank = wornModel(poolPart('tank')!);
+      this.root.add(this.tank);
+    }
+    if (this.tank) {
+      const sp = this.rig.bone('Spine2');
+      this.tank.visible = live && this.wantTank && !!sp;
+      if (this.tank.visible) placeWorn(this.tank, worn.tank, this.rig.root, sp!); // (sitio y tamaño: worn.json, editable en Anim Studio)
+    }
     // lo que lleva: en las manos, apuntando hacia donde mira
     _q.setFromEuler(_e.set(this.pitch, this.yaw, 0, 'YXZ'));
     const place = (it: THREE.Object3D, bone: THREE.Bone | undefined, on: boolean, fwd: number) => {
@@ -251,71 +302,34 @@ export class Remote {
     };
     place(this.items.flashlight, this.bones.LeftHand, live && this.held !== 'gun', 0.1);
     place(this.items.camera, this.bones.RightHand, live && this.held === 'camera', 0.12);
-    place(this.items.gun, this.bones.RightHand, live && this.held === 'gun', 0.25);
+    // el rifle: al pecho y un poco a la derecha, apuntando adonde mira (en la mano quedaba a la altura de la cadera y de lado)
+    const chest = this.rig.bone('Spine2'), gun = this.items.gun;
+    gun.visible = live && this.held === 'gun' && !!chest;
+    if (gun.visible) {
+      _e.set(0, this.yaw, 0, 'YXZ');
+      chest!.getWorldPosition(gun.position).addScaledVector(_a.set(0, 0, -1).applyEuler(_e), 0.42).addScaledVector(_b.set(1, 0, 0).applyEuler(_e), 0.17);
+      gun.position.y -= 0.05;
+      gun.quaternion.copy(_q);
+    }
     // el haz sale de la linterna
     this.clock += dt;
-    this.beam.visible = this.glow.visible = live && this.light;
+    // (con el rifle en la mano la linterna no se dibuja: la luz sale entonces del rifle, no de donde quedó la linterna)
+    const src = this.items.flashlight.visible ? this.items.flashlight : this.items.gun;
+    this.beam.visible = this.glow.visible = live && this.light && src.visible;
     if (this.beam.visible) {
-      (this.beam.position.copy(this.items.flashlight.position), this.beam.quaternion.copy(_q));
-      this.glow.position.copy(this.items.flashlight.position).addScaledVector(_v.set(0, 0, -1).applyQuaternion(_q), 0.12);
+      (this.beam.position.copy(src.position), this.beam.quaternion.copy(_q));
+      this.glow.position.copy(src.position).addScaledVector(_v.set(0, 0, -1).applyQuaternion(_q), 0.12);
       for (const m of this.beamMats) m.uniforms.uT.value = this.clock;
     }
     this.shadow.visible = this.floorShadow && live;
     this.shadow.position.set(this.pos.x, this.pos.y + 0.012, this.pos.z);
-    if (live && this.onStep && this.emoteK < 0.5 && this.speed > 0.3) {
+    if (live && this.onStep && !this.emote && this.speed > 0.3) {
       this.walked += this.speed * dt;
       const len = this.speed > 2.4 ? 1.1 : 0.7;
       if (this.walked > len) (this.walked -= len), this.onStep(this, this.speed > 2.4);
     }
     this.label.visible = live;
     this.label.position.set(this.pos.x, this.pos.y + 2.15 - 0.85 * this.crouch, this.pos.z);
-  }
-
-  /**
-   * Los emotes de la sala de espera: el rig solo trae andar, correr y quieto, así que son poses a mano: tras el mezclador, se
-   * apuntan los huesos (aim) hacia una dirección del mundo; `emoteK` (0–1) mezcla de la pose del clip a la del emote.
-   */
-  private pose(dt: number) {
-    const e = this.emote;
-    this.emoteK += ((e ? 1 : 0) - this.emoteK) * Math.min(1, dt * 9);
-    if (this.emoteK < 0.02) return;
-    const k = this.emoteK, t = this.clock, B = (n: string) => this.rig.bone(n);
-    _f.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
-    _r.set(-_f.z, 0, _f.x);
-    // apunta `bone` (cuyo hijo es `child`) a medio camino de donde estaba hacia `want`
-    const point = (bone: THREE.Object3D | undefined, child: THREE.Object3D | undefined, want: THREE.Vector3) => {
-      if (!bone || !child) return;
-      bone.updateWorldMatrix(true, true);
-      bone.getWorldPosition(_a);
-      child.getWorldPosition(_b);
-      _d.copy(_b).sub(_a).normalize().lerp(want.clone().normalize(), k).normalize();
-      aim(bone, child, _d);
-    };
-    const v = (f: number, up: number, r: number) => new THREE.Vector3().addScaledVector(_f, f).addScaledVector(_u, up).addScaledVector(_r, r);
-    const rA = B('RightArm'), rF = B('RightForeArm'), rH = B('RightHand'), lA = B('LeftArm'), lF = B('LeftForeArm'), lH = B('LeftHand');
-    if (e === 1) {
-      point(rA, rF, v(0.1, 0.85, 0.45));
-      point(rF, rH, v(0.05, 1, Math.sin(t * 9) * 0.6));
-    } else if (e === 2) {
-      point(rA, rF, v(0.95, 0.15, 0.1));
-      point(rF, rH, v(0.95, 0.15, 0.1));
-    } else if (e === 3) {
-      const c = 0.5 + 0.5 * Math.sin(t * 13);
-      point(lA, lF, v(0.5, -0.6, -0.3));
-      point(rA, rF, v(0.5, -0.6, 0.3));
-      point(lF, lH, v(0.8, 0.25, 0.25 + 0.5 * c));
-      point(rF, rH, v(0.8, 0.25, -0.25 - 0.5 * c));
-    } else if (e === 4) {
-      // sentado: la cadera baja y los muslos salen hacia delante
-      this.rig.root.position.y -= 0.46 * k;
-      point(B('LeftUpLeg'), B('LeftLeg'), v(0.97, 0.05, -0.1));
-      point(B('RightUpLeg'), B('RightLeg'), v(0.97, 0.05, 0.1));
-      point(B('LeftLeg'), B('LeftFoot'), v(-0.05, -1, -0.02));
-      point(B('RightLeg'), B('RightFoot'), v(-0.05, -1, 0.02));
-      point(lA, lF, v(0.15, -0.9, -0.2));
-      point(rA, rF, v(0.15, -0.9, 0.2));
-    }
-    this.rig.root.updateMatrixWorld(true);
   }
 
   dispose() {

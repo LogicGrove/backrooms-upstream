@@ -1,0 +1,23 @@
+/* El Tótem de la vida (ver Totem.tsx): mismo OSD de camcorder que el resto, sin cajas. */
+.br-totem { position: absolute; inset: 0; z-index: 6; padding: clamp(16px, 5vh, 44px) var(--br-gut); background: rgba(0, 0, 0, 0.8); font-size: clamp(16px, 1.8vw, 24px); }
+.br-totem__head { font-size: clamp(24px, 3vw, 40px); }
+.br-totem__sub { margin: 0.5em 0 clamp(18px, 4vh, 36px) !important; color: var(--br-dim); font-size: 0.7em; }
+.br-totem ul { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-left: -1.5em; }
+.br-totem__mate { gap: 0.8em; }
+.br-totem__mate img, .br-totem__mate > span:first-child { width: 1.6em; height: 1.6em; flex: none; }
+.br-thint { bottom: clamp(100px, 22vh, 190px); }
+.br-tnotes { position: absolute; top: clamp(16px, 4vh, 36px); left: 50%; transform: translateX(-50%); z-index: 3; pointer-events: none; text-align: center; display: flex; flex-direction: column; gap: 4px; font-size: clamp(13px, 1.3vw, 17px); white-space: nowrap; }
+.br-tnotes__imm { color: var(--br-ink); animation: br-tblink 0.25s steps(1) infinite; }
+.br-immune { position: absolute; inset: 0; z-index: 2; pointer-events: none; box-shadow: inset 0 0 0 3px var(--br-ink), inset 0 0 90px rgba(242, 241, 234, 0.22); animation: br-tblink 0.25s steps(1) infinite; }
+.br-run { position: absolute; inset: 0; z-index: 3; pointer-events: none; }
+.br-run__hit { position: absolute; inset: 0; background: radial-gradient(ellipse at center, transparent 35%, rgba(255, 58, 46, 0.65)); }
+.br-run__t { position: absolute; top: clamp(16px, 4vh, 36px); left: 50%; transform: translateX(-50%); font-size: clamp(16px, 1.8vw, 24px); white-space: nowrap; }
+.br-run__d { position: absolute; top: clamp(48px, 9vh, 80px); left: 50%; transform: translateX(-50%); font-size: clamp(13px, 1.3vw, 17px); white-space: nowrap; }
+.br-run__d[data-state="caught"] { color: var(--br-rec); font-size: clamp(24px, 3vw, 40px); top: 38vh; }
+.br-run__a { position: absolute; top: clamp(16px, 4vh, 36px); right: var(--br-gut); font-size: clamp(13px, 1.3vw, 17px); color: var(--br-dim); }
+.br-run__k { position: absolute; bottom: clamp(24px, 6vh, 52px); left: 50%; transform: translateX(-50%); font-size: clamp(12px, 1.1vw, 15px); color: var(--br-dim); white-space: nowrap; }
+@keyframes br-tblink { 50% { opacity: 0.25; } }
+@media (prefers-reduced-motion: reduce) { .br-tnotes__imm, .br-immune { animation: none; } }
+.br-run__n { position: absolute; top: 34vh; left: 0; right: 0; text-align: center; margin: 0; font-size: clamp(64px, 12vw, 160px); color: var(--br-rec); text-shadow: 0 0 24px rgba(255, 58, 46, 0.6); }
+.br-run__w { font-size: clamp(26px, 4vw, 54px); }
+.br-run__w small { display: block; margin-top: 14px; font-size: clamp(12px, 1.2vw, 16px); color: var(--br-dim); text-shadow: none; line-height: 1.6; }

@@ -20,6 +20,9 @@
 /* la mochila */
 .iv-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; padding: 6px; border: 1px solid var(--br-dim); }
 .iv-grid[data-over] { border-color: var(--br-ink); background: rgba(242, 241, 234, 0.12); }
+/* casilla de la mochila como destino: igual que las ranuras */
+.iv-cell[data-fits] { border-color: var(--br-ink); }
+.iv-cell[data-over] { background: var(--br-ink); }
 .iv-cell { position: relative; aspect-ratio: 1; border: 1px solid #5d5b52; background: rgba(0, 0, 0, 0.35); display: flex; align-items: center; justify-content: center; }
 
 /* un objeto dentro de una casilla */
@@ -29,6 +32,12 @@
 .br .iv-item:hover, .br .iv-item:focus-visible, .br .iv-item[data-sel] { background: var(--br-ink); color: #000; outline: none; }
 .br .iv-item:hover b, .br .iv-item[data-sel] b, .br .iv-item:focus-visible b { text-shadow: none; }
 .br .iv-item[data-held] { opacity: 0.45; }
+
+/* la barra de acceso rápido, en una fila bajo las tres columnas */
+.iv-hot { grid-column: 1 / -1; }
+.iv-hotrow { display: grid; grid-template-columns: repeat(4, minmax(0, 76px)); gap: 6px; }
+.iv-slot[data-sel] { border-color: var(--br-ink); }
+.iv-slot[data-sel] .iv-label { color: var(--br-ink); }
 
 /* el detalle */
 .iv-detail { display: grid; grid-template-columns: clamp(64px, 6vw, 96px) 1fr; gap: 12px; align-items: start; border: 1px solid var(--br-dim); padding: 10px; }
@@ -41,6 +50,10 @@
 .iv-ghost { position: fixed; left: -34px; top: -34px; width: 68px; height: 68px; z-index: 7; pointer-events: none; opacity: 0.92; }
 .iv-ghost img { width: 100%; height: 100%; object-fit: contain; filter: drop-shadow(3px 3px 0 rgba(0, 0, 0, 0.8)); }
 
+/* sin selección de texto ni arrastre nativo; el destino válido se marca mientras se arrastra */
+.br-inv { user-select: none; -webkit-user-select: none; }
+.iv-grid[data-fits] { border-color: var(--br-ink); }
+
 /* pantallas estrechas: las columnas se apilan */
 @media (max-width: 960px) {
   .iv { grid-template-columns: minmax(0, 1fr); }
@@ -49,3 +62,7 @@
 @media (prefers-reduced-motion: reduce) {
   .iv-avatar { cursor: default; }
 }
+
+/* arrastrando fuera del panel: se suelta al suelo */
+.iv-ghost[data-drop] img { outline: 1px dashed var(--br-rec); outline-offset: 2px; }
+.iv-ghost__drop { position: absolute; left: 50%; top: 100%; transform: translateX(-50%); margin-top: 6px; color: var(--br-rec); font-size: 13px; letter-spacing: 0.1em; text-shadow: 2px 2px 0 #000; }

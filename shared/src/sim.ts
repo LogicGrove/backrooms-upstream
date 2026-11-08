@@ -1,4 +1,5 @@
 import { bfs, CELL, DIRS as MAZE_DIRS, type Cell, type Maze } from './maze';
+import type { ItemKind } from './index';
 
 /*
  * La lógica de las entidades (bacteria y partygoer), sin gráficos: la corre el servidor en las salas y el
@@ -44,6 +45,8 @@ export interface SimTarget {
   torch: [number, number, number] | null;
   /** Bajo los fluorescentes encendidos. */
   exposed: boolean;
+  /** Agachado: lo ven de la mitad de lejos (y la linterna no lo delata de lejos). */
+  duck?: boolean;
 }
 
 // persiguen más rápido de lo que andas y más despacio de lo que corres: escapar cuesta aguante
@@ -53,11 +56,20 @@ const WANDER = 1.1, CHASE = 2.9, CONE = (50 * Math.PI) / 180, LOSE = 4, REACH = 
 const HIDE_RANGE = 2 * CELL + 0.3, INSPECT_T = [4, 5.5] as const, REACT = 0.9, BAD_T = 0.7, COOL = 20;
 // a cuánto te ven: a oscuras, bajo los fluorescentes y con la linterna encendida; el haz en la cara, a 0,3 rad
 const SIGHT_DARK = 7, SIGHT_LIT = 14, SIGHT_TORCH = 20, BEAM = 0.3;
+// el salto: si lleva FAR_T s a más de FAR_ROUTE celdas de ruta del jugador más cercano, sin verlo nadie ni a menos de
+// TP_SAFE m, se recoloca a TP_NEAR celdas de ruta de él (fuera de la vista); luego TP_CD s de enfriamiento
+const FAR_ROUTE = 45, FAR_T = 30, TP_CD = 70, TP_NEAR = [22, 35] as const, TP_SAFE = 15;
 const TAU = Math.PI * 2;
 const mod = (a: number, n: number) => ((a % n) + n) % n;
 const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]] as const;
 
 export const centerOf = (c: Cell) => ({ x: c.x * CELL + CELL / 2, z: c.y * CELL + CELL / 2 });
+
+/** Dónde se pone el jugador `i` dentro de la celda de salida: cada uno en una esquina (a ~0,7 m del vecino, más que dos cuerpos de 0,3 m de radio), no todos en el centro. */
+export const startOffset = (i: number): [number, number] => {
+  const [x, z] = [[-1, -1], [1, 1], [1, -1], [-1, 1]][((i % 4) + 4) % 4];
+  return [x * 0.35, z * 0.35];
+};
 
 /** Quien está en un nicho: `holding` es lo que de verdad contiene (ya con el aire), `noise` 1 al correr y baja con el tiempo. */
 export interface HideOcc {
@@ -154,6 +166,16 @@ export class EntitySim {
   /** La inspección en curso y los nichos que ya ha mirado (se olvidan al alejarse). */
   private insp?: { h: HideState; t: number; walk: number; bad: number; dur: number };
   private rolled = new Set<number>();
+  // el salto: segundos lejos, enfriamiento (empieza con algo para no saltar nada más empezar) y reloj de las comprobaciones
+  private farT = 0;
+  private tpCd = 40;
+  private tpChk = 0;
+  /** La celda a la que se dirige el camino de persecución y los segundos desde que se trazó (repath con histéresis). */
+  private routeKey = -1;
+  private routeAge = 0;
+  /** Atasco: dónde estaba hace un rato y cuánto lleva sin avanzar yendo a un sitio. */
+  private stuckAt = { x: 0, z: 0 };
+  private stuckT = 0;
 
   /** `recover`: tras atacar, baila un rato y vuelve a lo suyo (en las salas; en solitario la partida acaba). */
   constructor(
@@ -247,6 +269,45 @@ export class EntitySim {
   }
 
   /**
+   * Recolocarse si está muy lejos de todos (ver FAR_*). Cuenta también a los escondidos (nichos ocupados). Se comprueba
+   * 1 vez por segundo; nunca a la vista de nadie ni cerca, y solo en `wander` (quien llama).
+   */
+  private maybeTeleport(dt: number, targets: SimTarget[], hides: HideState[]) {
+    this.tpCd -= dt;
+    if (this.tpCd > 0) return;
+    if ((this.tpChk -= dt) > 0) return;
+    this.tpChk = 1;
+    const m = this.maze, pts = [...targets.map((t) => ({ x: t.x, z: t.z, ex: t.ex, ez: t.ez })), ...hides.filter((h) => h.occ).map((h) => ({ x: h.x, z: h.z, ex: h.x, ez: h.z }))];
+    if (!pts.length) return void (this.farT = 0);
+    const me = this.cellOf(this.x, this.z), key = (c: Cell) => c.y * m.w + c.x;
+    const unseen = pts.every((p) => Math.hypot(p.x - this.x, p.z - this.z) > TP_SAFE && !seesXZ(this.solid, this.x, this.z, p.ex, p.ez));
+    const ds = pts.map((p) => bfs(m, this.cellOf(p.x, p.z), this.blocked));
+    const near = Math.min(...ds.map((d) => (d[key(me)] < 0 ? Infinity : d[key(me)])));
+    if (!unseen || near < FAR_ROUTE) return void (this.farT = 0);
+    if ((this.farT += 1) < FAR_T) return;
+    // candidatas: a distancia media por ruta del más cercano, lejos en línea recta y sin línea de visión con nadie
+    const ok: Cell[] = [];
+    for (let y = 0; y < m.h; y++)
+      for (let x = 0; x < m.w; x++) {
+        const k = y * m.w + x;
+        if (!m.open[k] || this.blocked.has(k)) continue;
+        const r = Math.min(...ds.map((d) => (d[k] < 0 ? Infinity : d[k])));
+        if (r < TP_NEAR[0] || r > TP_NEAR[1]) continue;
+        const c = centerOf({ x, y });
+        if (pts.every((p) => Math.hypot(p.x - c.x, p.z - c.z) > TP_SAFE && !seesXZ(this.solid, c.x, c.z, p.ex, p.ez))) ok.push({ x, y });
+      }
+    if (!ok.length) return;
+    const to = centerOf(ok[(Math.random() * ok.length) | 0]);
+    this.x = to.x;
+    this.z = to.z;
+    this.path = [];
+    this.rest = 2;
+    this.alert = 0;
+    this.farT = 0;
+    this.tpCd = TP_CD;
+  }
+
+  /**
    * Cuánto se da cuenta de `t` por segundo (0: no lo ve). Lo ve sin pared en medio, dentro de su cono (o
    * a menos de 2,5 m) y a SIGHT_DARK, SIGHT_LIT o SIGHT_TORCH según dónde esté y si lleva la linterna
    * encendida; si le da con el haz, aunque no mire y más deprisa. Persiguiendo no le hace falta el cono y
@@ -256,6 +317,8 @@ export class EntitySim {
     const my = this.height * 0.85, tx = t.ex - this.x, ty = t.ey - my, tz = t.ez - this.z, d = Math.hypot(tx, ty, tz), chasing = this.state === 'chase';
     let range = t.torch ? SIGHT_TORCH : t.exposed ? SIGHT_LIT : SIGHT_DARK;
     if (chasing) range = Math.min(18, range * 2);
+    // agachado cuesta más verte y seguirte: la mitad de alcance (incluso persiguiendo, así que puedes escabullirte)
+    if (t.duck) range *= 0.5;
     // el ángulo entre el haz y la línea del ojo a la entidad
     let beamed = false;
     if (t.torch && d < SIGHT_TORCH && d > 1e-6) {
@@ -275,6 +338,8 @@ export class EntitySim {
   update(dt: number, targets: SimTarget[], god = false, hides: HideState[] = []): string | undefined {
     let caught: string | undefined;
     this.moving = false;
+    // dentro de una pared o un nicho (no debería): a la celda abierta más cercana
+    if (this.alive && this.solid(this.x, this.z)) this.unstick();
     if (this.state === 'inspect') return this.inspect(dt, god);
     if ((this.state === 'wander' || this.state === 'chase') && hides.length && this.maybeInspect(hides)) return undefined;
     if (this.state === 'wander' || this.state === 'chase') {
@@ -295,8 +360,12 @@ export class EntitySim {
       }
       const hunting = this.state === 'chase';
       this.repath -= dt;
+      if (!hunting) this.maybeTeleport(dt, targets, hides);
+      this.routeAge += dt;
       if (hunting) {
-        if (this.repath <= 0 || !this.path.length) (this.path = this.route(this.cellOf(this.seen.x, this.seen.z))), (this.repath = 0.5);
+        // histéresis: con camino, solo se retraza si el objetivo cambió de celda (o el camino ya es viejo)
+        const sc = this.cellOf(this.seen.x, this.seen.z), k = sc.y * this.maze.w + sc.x;
+        if (this.repath <= 0 && (!this.path.length || k !== this.routeKey || this.routeAge > 2)) (this.path = this.route(sc)), (this.repath = 0.5), (this.routeKey = k), (this.routeAge = 0);
       } else if (!this.path.length && (this.rest -= dt) <= 0) {
         const s = centerOf(this.darkSpot());
         (this.path = this.route(this.cellOf(s.x, s.z))), (this.rest = 3 + Math.random() * 5);
@@ -313,22 +382,45 @@ export class EntitySim {
         if (d < 0.15 && !near) this.path.shift();
         else if (d > 1e-6) {
           const k = Math.min(d, v * dt) / d, nx = this.x + tx * k, nz = this.z + tz * k;
-          if (!near || !this.blockedAt(nx, nz)) (this.x = nx), (this.z = nz);
+          // (nunca a una pared ni a un nicho: un jugador a medio entrar en uno no lo abre)
+          if (!this.solid(nx, nz) && (!near || !this.blockedAt(nx, nz))) (this.x = nx), (this.z = nz);
           this.moving = true;
         }
         this.turn(tx, tz, dt);
       } else if (wary && watch) this.turn(watch.x - this.x, watch.z - this.z, dt);
+      // atasco: yendo a un sitio y sin avanzar 1,5 s, se descarta el camino y se traza otro
+      if (goal && this.moving) {
+        if ((this.stuckT += dt) > 1.5) {
+          if (Math.hypot(this.x - this.stuckAt.x, this.z - this.stuckAt.z) < 0.25) (this.path = []), (this.repath = 0), (this.rest = 0);
+          (this.stuckAt = { x: this.x, z: this.z }), (this.stuckT = 0);
+        }
+      } else (this.stuckT = 0), (this.stuckAt = { x: this.x, z: this.z });
       if (this.state === 'chase' && !god) {
         const hit = targets.find((t) => Math.hypot(t.x - this.x, t.z - this.z) < REACH && Math.abs(t.y) < 1.2);
         if (hit) (this.state = 'attack'), (this.phase = 0), (caught = hit.id);
       }
     } else if (this.recover && (this.state === 'attack' || this.state === 'dance')) {
-      // tras atacar: un momento de ataque, un baile y de vuelta a lo suyo
+      // tras atacar: un momento de ataque y de vuelta a lo suyo (sin baile)
       this.phase += dt;
-      if (this.state === 'attack' && this.phase > 1.3) (this.state = 'dance'), (this.phase = 0);
-      else if (this.state === 'dance' && this.phase > 5) (this.state = 'wander'), (this.alert = 0), (this.path = []), (this.rest = 2);
+      if (this.phase > 1.3) (this.state = 'wander'), (this.alert = 0), (this.path = []), (this.rest = 2);
     }
     return caught;
+  }
+
+  private unstick() {
+    const m = this.maze, me = this.cellOf(this.x, this.z);
+    let best: Cell | undefined, bd = Infinity;
+    for (let r = 1; r < 6 && !best; r++)
+      for (let y = me.y - r; y <= me.y + r; y++)
+        for (let x = me.x - r; x <= me.x + r; x++) {
+          if (x < 0 || y < 0 || x >= m.w || y >= m.h || !m.open[y * m.w + x] || this.blocked.has(y * m.w + x)) continue;
+          const c = centerOf({ x, y }), d = Math.hypot(c.x - this.x, c.z - this.z);
+          if (d < bd) (bd = d), (best = { x, y });
+        }
+    if (!best) return;
+    const c = centerOf(best);
+    (this.x = c.x), (this.z = c.z), (this.path = []);
+    if (this.insp) (this.insp.h.by = null), (this.insp = undefined), (this.state = 'wander');
   }
 
   /** Hay un nicho ocupado a <= 2 celdas y a la vista: una vez por pasada, con probabilidad (más si el que está dentro hizo ruido). */
@@ -355,7 +447,7 @@ export class EntitySim {
     if (!h.occ) {
       // ha salido: lo ve
       stop();
-      (this.state = 'chase'), (this.alert = 1), (this.lost = 0), (this.repath = 0), (this.seen = { x: h.x, z: h.z });
+      (this.state = 'chase'), (this.alert = 1), (this.lost = 0), (this.repath = 0), (this.seen = { x: h.fx, z: h.fz });
       return undefined;
     }
     const d = Math.hypot(h.fx - this.x, h.fz - this.z);
@@ -413,15 +505,78 @@ export class EntitySim {
 /** Los objetos de una partida, sacados del mapa (la misma lista en el servidor y el cliente). */
 export interface ItemSpot {
   id: string;
-  kind: 'tape' | 'flashlight' | 'camera' | 'gun';
+  kind: ItemKind;
   cell: Cell;
+  /** Poolrooms: 1 si está en la planta alta (ver Maze.lay); su altura sale de poolCellY(mapa, x, y, 1). */
+  floor?: 0 | 1;
 }
+/**
+ * Dónde hay latas de Almond Water: 5 celdas abiertas, lejos del inicio, del ascensor, de lo demás y unas de otras.
+ * Solo depende del mapa (no consume su azar): cliente y servidor sacan las mismas.
+ */
+export function waterSpots(m: Maze, n = 5): Cell[] {
+  if (m.waters) return m.waters; // Poolrooms: ya vienen puestas
+  const used = new Set<number>(), key = (c: Cell) => c.y * m.w + c.x;
+  [m.start, m.elevator, m.camera, ...(m.pistol ? [m.pistol] : []), ...m.extraGuns, ...m.tapes, ...m.flashlights, ...m.voids, ...m.props.map((p) => p.cell)].forEach((c) => used.add(key(c)));
+  const free: Cell[] = [];
+  for (let y = 0; y < m.h; y++) for (let x = 0; x < m.w; x++) if (m.open[y * m.w + x] && !used.has(y * m.w + x)) free.push({ x, y });
+  // orden fijo pero revuelto (un hash de la celda)
+  const h = (c: Cell) => Math.imul((c.x * 73856093) ^ (c.y * 19349663) ^ (m.w * 83492791), 0x9e3779b1) >>> 0;
+  free.sort((a, b) => h(a) - h(b));
+  const far = (a: Cell, b: Cell, k: number) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y) >= k;
+  const out: Cell[] = [];
+  for (const c of free) {
+    if (out.length >= n) break;
+    if (far(c, m.start, 12) && far(c, m.elevator, 6) && [m.camera, ...m.tapes, ...m.flashlights].every((o) => far(c, o, 4)) && out.every((o) => far(c, o, 14))) out.push(c);
+  }
+  return out;
+}
+
+/**
+ * El Tótem de la vida: en ~35 % de las partidas (según la semilla) y solo con 2 o más jugadores, una celda abierta lejos del inicio,
+ * del ascensor, de lo demás y de las latas. No consume el azar del mapa: cliente y servidor sacan la misma.
+ */
+export const TOTEM_CHANCE = 0.35;
+export function totemSpot(m: Maze, seed: number, players: number): Cell | null {
+  if (players < 2 || (Math.imul(seed ^ 0x2545f491, 0x9e3779b1) >>> 0) / 4294967296 >= TOTEM_CHANCE) return null;
+  const used = new Set<number>(), key = (c: Cell) => c.y * m.w + c.x;
+  const water = waterSpots(m);
+  [m.start, m.elevator, m.camera, ...(m.pistol ? [m.pistol] : []), ...m.extraGuns, ...m.tapes, ...m.flashlights, ...water, ...(m.tank ? [m.tank] : []), ...(m.watergun ? [m.watergun] : []), ...m.voids, ...m.props.map((p) => p.cell)].forEach((c) => used.add(key(c)));
+  const h = (c: Cell) => Math.imul((c.x * 19349663) ^ (c.y * 73856093) ^ seed, 0x85ebca6b) >>> 0;
+  const far = (a: Cell, b: Cell, k: number) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y) >= k;
+  const free: Cell[] = [];
+  for (let y = 0; y < m.h; y++) for (let x = 0; x < m.w; x++) if (m.open[y * m.w + x] && !used.has(y * m.w + x)) free.push({ x, y });
+  free.sort((a, b) => h(a) - h(b));
+  return free.find((c) => far(c, m.start, 14) && far(c, m.elevator, 6) && [m.camera, ...m.tapes, ...m.flashlights, ...water].every((o) => far(c, o, 5))) ?? null;
+}
+
+/**
+ * El radar: uno por mapa, siempre; una celda abierta lejos del inicio, del ascensor y de lo demás (latas y tótem incluidos).
+ * Solo depende del mapa: cliente y servidor sacan la misma. Se lo queda quien lo coja (id r0).
+ */
+export function radarSpot(m: Maze): Cell | null {
+  const used = new Set<number>(), key = (c: Cell) => c.y * m.w + c.x, water = waterSpots(m), others = [m.camera, ...m.tapes, ...m.flashlights, ...water, ...(m.totem ? [m.totem] : []), ...(m.tank ? [m.tank] : []), ...(m.watergun ? [m.watergun] : [])];
+  [m.start, m.elevator, ...others, ...(m.pistol ? [m.pistol] : []), ...m.extraGuns, ...m.voids, ...m.props.map((p) => p.cell)].forEach((c) => used.add(key(c)));
+  const h = (c: Cell) => Math.imul((c.x * 83492791) ^ (c.y * 73856093) ^ (m.w * 19349663), 0xc2b2ae35) >>> 0;
+  const far = (a: Cell, b: Cell, k: number) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y) >= k;
+  const free: Cell[] = [];
+  for (let y = 0; y < m.h; y++) for (let x = 0; x < m.w; x++) if (m.open[y * m.w + x] && !used.has(y * m.w + x)) free.push({ x, y });
+  free.sort((a, b) => h(a) - h(b));
+  return free.find((c) => far(c, m.start, 16) && far(c, m.elevator, 6) && others.every((o) => far(c, o, 4))) ?? free.find((c) => far(c, m.start, 8)) ?? null;
+}
+
 export function itemSpots(m: Maze): ItemSpot[] {
-  const out: ItemSpot[] = [];
-  m.tapes.forEach((cell, i) => out.push({ id: 't' + i, kind: 'tape', cell }));
-  m.flashlights.forEach((cell, i) => out.push({ id: 'f' + i, kind: 'flashlight', cell }));
-  out.push({ id: 'c', kind: 'camera', cell: m.camera });
-  if (m.pistol) out.push({ id: 'g', kind: 'gun', cell: m.pistol });
-  m.extraGuns.forEach((cell, i) => out.push({ id: 'g' + (i + 1), kind: 'gun', cell }));
+  const out: ItemSpot[] = [], add = (id: string, kind: ItemKind, cell: Cell) => out.push(m.lay ? { id, kind, cell, floor: m.lay[cell.y * m.w + cell.x] ? 1 : 0 } : { id, kind, cell });
+  m.tapes.forEach((cell, i) => add('t' + i, 'tape', cell));
+  m.flashlights.forEach((cell, i) => add('f' + i, 'flashlight', cell));
+  waterSpots(m).forEach((cell, i) => add('w' + i, 'water', cell));
+  if (m.totem) add('m0', 'totem', m.totem);
+  if (m.tank) add('k0', 'tank', m.tank);
+  if (m.watergun) add('p0', 'watergun', m.watergun);
+  const rd = radarSpot(m);
+  if (rd) add('r0', 'radar', rd);
+  add('c', 'camera', m.camera);
+  if (m.pistol) add('g', 'gun', m.pistol);
+  m.extraGuns.forEach((cell, i) => add('g' + (i + 1), 'gun', cell));
   return out;
 }

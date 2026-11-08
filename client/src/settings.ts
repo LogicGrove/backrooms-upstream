@@ -17,9 +17,11 @@ export interface Settings {
   crosshair: boolean; // el punto de mira, en el centro de la imagen
   reduceMotion: boolean; // sin aplicar aún
   toggleBreath: boolean; // alternar en vez de mantener (sin aplicar aún)
+  resScale: number; // 0,5–1: escala de la resolución de dibujo
+  brightness: number; // 0,6–1,6: brillo de la imagen
 }
 
-export const DEFAULTS: Settings = { volume: 1, sfx: 1, ambient: 1, sens: 1, invertY: false, vhs: 1, fov: 70, fps: false, crosshair: true, reduceMotion: false, toggleBreath: false };
+export const DEFAULTS: Settings = { volume: 1, sfx: 1, ambient: 1, sens: 1, invertY: false, vhs: 1, fov: 70, fps: false, crosshair: true, reduceMotion: false, toggleBreath: false, resScale: 1, brightness: 1 };
 
 const KEY = 'br-settings';
 const read = (): Settings => {

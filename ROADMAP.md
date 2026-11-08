@@ -9,7 +9,9 @@ Web aparte (antes era el easter egg de `s7lver2/webpage`, que queda congelado). 
 - [x] Fotos del inventario: clic para ampliar y descargar
 - [x] Linterna con batería corta (90 s) y linternas de repuesto por el mapa
 - [ ] Iluminación más realista (luz de área, parpadeo que afecta a las paredes, marcos de panel)
-- [ ] Agujeros del suelo
+- [x] Agujeros del suelo (y salas de pozos: rejilla de fosos o campo con puente en cruz)
+- [x] Mapa más pequeño y legible: zonas con forma y tono de luz propios (pozos, cubículos, oficinas, estanterías), más bucles; mobiliario con modelos de `/assets-src` (ver `client/public/models/CREDITS.md`)
+- [ ] Pasillo elevado sobre un foso (la colisión actual solo tiene suelo a y=0)
 - [ ] Props reutilizados de los modelos de `/galery`
 - [ ] IK de manos nuevo + herramienta dev de agarres
 - [ ] Animación de entrada (la tele) más trabajada
@@ -26,3 +28,7 @@ Web aparte (antes era el easter egg de `s7lver2/webpage`, que queda congelado). 
 - Vercel sirve bien el cliente estático, pero sus funciones no mantienen WebSockets abiertos: el servidor de salas va en otro sitio.
 - Candidatos gratis para el servidor en tiempo real: Cloudflare Workers + Durable Objects, Render (plan gratis, se duerme), una VM Always Free de Oracle, o el PC propio con un túnel de Cloudflare. Pendiente de decidir.
 - Cuentas y logros: una base gratis (Upstash Redis, ya usada en el portfolio, o Turso/Neon).
+
+## Bucle por rondas (hecho: servidor, protocolo y HUD mínimo)
+- Dentro de una sala, en memoria del servidor: pizarra con 3 misiones votadas (fotos, cintas, sobrevivir, apagar teles), dinero común, tienda en el ordenador, inventario por jugador que se conserva si se sube vivo al ascensor, objetos soltados con Y, cobro o penalización del 25 % al acabar la ronda. Protocolo en `shared/src/missions.ts` y `shared/src/index.ts`.
+- Pendiente (UI): pizarra y voto, tienda en el ordenador, arrastrar fuera del inventario para soltar, HUD de dinero.

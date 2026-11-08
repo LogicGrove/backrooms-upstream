@@ -1,19 +1,41 @@
 /** Lo que comparten el cliente y el servidor: los puertos fijos, el protocolo de las salas y la lógica de la partida. */
 export * from './maze';
+export * from './pools';
 export * from './sim';
 export * from './progress';
-import type { EntState } from './sim';
+export * from './missions';
+export * from './caps';
+import type { EntState, Kind } from './sim';
 import type { Look } from './progress';
+import type { LevelCaps } from './caps';
+import type { ActiveMission, Drop, Inventory, ItemId, MissionOffer, RoundResult } from './missions';
 
 export const CLIENT_PORT = 5180;
 export const SERVER_PORT = 5181;
 
 export const MAX_PLAYERS = 4;
+/** Cinta de acordonar: tramos continuos por el suelo. Cada jugador puede tener STRIP_MAX a la vez (al pasar, se va el más viejo). */
+export const STRIP_MAX = 4;
+/** Puntos por tramo y metros mínimos entre dos puntos seguidos. */
+export const STRIP_PTS = 60;
+export const STRIP_GAP = 0.4;
+/** Un tramo: la lista de puntos (x, z, x, z...) por donde se fue tendiendo, en el orden en que se hizo (los chevrones apuntan hacia el final). */
+export interface Strip {
+  id: string;
+  owner: string;
+  pts: number[];
+}
 export const NAME_MAX = 16;
 export const CHAT_MAX = 200;
+/** Vida: el máximo y lo que quita cada golpe de una entidad (dos matan). */
+export const HP_MAX = 100;
+export const HIT_DAMAGE = 60;
+/** Tótem de la vida: ms de inmunidad al volver y lo mínimo (ms) que puede tardar en acabarse el nivel «Run for your life» (anti-trampas). */
+export const REVIVE_IMMUNE = 3000;
+export const REVIVE_MIN = 30000;
 /** Milisegundos mínimos entre dos mensajes de chat de un jugador. */
 export const CHAT_GAP = 500;
-/** Cintas que hay que juntar entre todos para que se abra la salida. */
+/** Cintas repartidas por el mapa (la misión «FIND TAPES» pide algunas de ellas). */
 export const TAPES_NEEDED = 8;
 
 /** Lo que cada jugador manda ~15 veces por segundo (el servidor lo reparte a su sala; también en la sala de espera). */
@@ -29,8 +51,18 @@ export interface PlayerState {
   light: boolean;
   /** Lo que lleva en la mano derecha. */
   held: 'none' | 'camera' | 'gun';
+  /** Agachado: las entidades te ven de menos lejos. */
+  duck?: boolean;
+  /** Poolrooms: lleva la bombona de buceo a la espalda. */
+  tank?: boolean;
+  /** Poolrooms: ms restantes de «sin señal» del radar (lo pone el cliente al usar un túnel sin fondo; ver docs/poolrooms.md §11). */
+  jam?: number;
   /** Solo en la sala de espera: 0 nada, 1 saludar, 2 señalar, 3 aplaudir, 4 sentarse. */
   emote?: number;
+  /** Baile de victoria que está bailando (id de client/src/game/anim/dances.json); vacío = ninguno. */
+  dance?: string;
+  /** Variante de animación que lleva puesta (cosmético: id de anim/variants.json). */
+  variant?: string;
   /** Escondido en un nicho de la pared (x, z son los del nicho). El servidor lo valida. */
   hiding?: boolean;
   /** Mantiene la respiración (Space) mientras está escondido; el servidor lo devuelve ya con el aire. */
@@ -40,6 +72,8 @@ export interface PlayerState {
    * quien lo recibe reconstruye el ritmo del emisor aunque los paquetes lleguen en ráfaga o tarde (ver client/src/game/interp.ts).
    */
   t?: number;
+  /** Vida (0–100). La pone el servidor al repartir los estados; lo que mande el cliente se ignora. */
+  hp?: number;
 }
 /** Emotes de la sala de espera (teclas 1–4) y los ms mínimos entre dos cambios de uno. */
 export const EMOTES = ['', 'WAVE', 'POINT', 'CLAP', 'SIT'] as const;
@@ -49,19 +83,25 @@ export const EMOTE_GAP = 200;
 export type Phase = 'lobby' | 'starting' | 'playing' | 'over';
 /** Lo que dura la entrada por la puerta (ms) entre el botón y la partida. */
 export const START_DELAY = 7500;
+/** Al acabar la entrada se vota la misión: ms que dura la votación (se cierra antes si han votado todos) y ms extra que se espera a que todos hayan cargado el nivel. */
+export const VOTE_TIME = 15000;
+export const LOAD_GRACE = 12000;
 /**
  * La sala de espera 3D: 6 × 5 m centrada en el origen (x a lo ancho, z a lo largo; el suelo, en y = 0). En la
  * fase `lobby` y `starting`, las posiciones de los jugadores son de esta sala; el servidor las recorta a la caja.
  */
 export const WAIT_HALF = { x: 3, z: 2.5 };
 /** Dónde aparece cada jugador (por orden en la sala): en fila frente a la puerta, mirando a -z. */
-export const WAIT_SPAWNS = [{ x: -1.5, z: 1.6 }, { x: -0.5, z: 1.6 }, { x: 0.5, z: 1.6 }, { x: 1.5, z: 1.6 }];
+export const WAIT_SPAWNS = [{ x: -1.5, z: 0.9 }, { x: -0.5, z: 0.9 }, { x: 0.5, z: 0.9 }, { x: 1.5, z: 0.9 }]; // en medio de la sala: lejos de los sillones de la pared sur (z ≥ 1,84) y del resto de muebles
 export type Difficulty = 'easy' | 'normal' | 'hard';
-/** Lo que mueve cada dificultad: entidades más o menos rápidas, tiempo sin que ataquen al empezar (s) y vida de la linterna (s). */
-export const DIFFICULTY: Record<Difficulty, { speed: number; grace: number; life: number }> = {
-  easy: { speed: 0.85, grace: 16, life: 140 },
-  normal: { speed: 1, grace: 10, life: 90 },
-  hard: { speed: 1.2, grace: 6, life: 60 },
+/**
+ * Lo que mueve cada dificultad: entidades más o menos rápidas, tiempo sin que ataquen al empezar (s), vida de la linterna (s),
+ * cuántas entidades hay al empezar, qué parte de las latas, linternas y rifles extra del mapa queda (loot) y cuánto paga cada misión (money).
+ */
+export const DIFFICULTY: Record<Difficulty, { speed: number; grace: number; life: number; ents: number; loot: number; money: number }> = {
+  easy: { speed: 0.85, grace: 16, life: 140, ents: 1, loot: 1, money: 0.75 },
+  normal: { speed: 1, grace: 10, life: 90, ents: 2, loot: 0.8, money: 1 },
+  hard: { speed: 1.2, grace: 6, life: 60, ents: 3, loot: 0.5, money: 1.5 },
 };
 export const ROOM_NAME_MAX = 20;
 /** Lo que el propietario puede cambiar de la sala (en el lobby). */
@@ -72,6 +112,8 @@ export interface RoomSettings {
   difficulty: Difficulty;
   /** 0 = aleatoria. */
   fixedSeed: number;
+  /** Las Poolrooms entran en el sorteo de niveles (apagado por defecto). */
+  pools: boolean;
 }
 export interface Room extends RoomSettings {
   code: string;
@@ -81,6 +123,24 @@ export interface Room extends RoomSettings {
   phase: Phase;
   /** 0 hasta que el propietario da a EMPEZAR. */
   seed: number;
+  /** Saldo común del equipo (dinero). Sube con las recompensas, baja con las compras y las penalizaciones. */
+  bank: number;
+  /** Número de la ronda (1 la primera; sube al volver al lobby). */
+  round: number;
+  /** El nivel de la ronda (clave de LEVELS en shared/missions.ts). */
+  levelId: string;
+  /** Capacidades del nivel (levelCaps(levelId)): qué componentes del jugador están activos. */
+  caps: LevelCaps;
+  /** Fase `starting`: las 3 misiones a votar con sus votos. Vacío en las demás fases. */
+  offers: MissionOffer[];
+  /** `starting`: la misión que ganaría ahora (la más votada; sin votos, la primera). El empate real se sortea al cerrar la votación. */
+  leading: string;
+  /** `starting`, ya abierta la votación (acabada la entrada por la puerta): ms que le quedan (cuenta atrás local desde este valor; 0 = cerrada, el servidor espera a la carga) y quiénes ya han cargado el nivel. Null si no. */
+  vote: { left: number; loaded: string[] } | null;
+  /** La misión elegida (al cerrarse la votación) con su progreso; `done` = el ascensor está abierto. Null en el lobby y mientras se vota. */
+  mission: ActiveMission | null;
+  /** Partida, tras subir el primero: segundos que quedan para cerrar la ronda (cuenta atrás local desde este valor) y quiénes han subido. Null si nadie ha subido. */
+  ascent: { left: number; boarded: string[] } | null;
 }
 export interface Member {
   id: string;
@@ -88,6 +148,12 @@ export interface Member {
   dead: boolean;
   /** Su aspecto: el de su cuenta (lo valida el servidor) o, siendo invitado, un color gratis. */
   look: Look;
+  /** Su foto de perfil: `<id>?v=<versión>` para GET /api/avatar/...; vacío si no tiene. */
+  avatar: string;
+  /** Marcó que está listo en la sala de espera (solo informativo: empieza el propietario). */
+  ready: boolean;
+  /** Ha subido vivo al ascensor en la ronda en curso. */
+  boarded: boolean;
 }
 export type RoomView = Room & { players: Member[] };
 export interface RoomInfo {
@@ -107,7 +173,7 @@ export interface RoomInfo {
 export type Joined = { id: string; room: RoomView } | { error: string };
 
 /** Un objeto de la partida: cinta, linterna, cámara o rifle. */
-export type ItemKind = 'tape' | 'flashlight' | 'camera' | 'gun';
+export type ItemKind = 'tape' | 'flashlight' | 'camera' | 'gun' | 'water' | 'totem' | 'radar' | 'tank' | 'watergun';
 export interface WorldSnapshot {
   /** Reloj del servidor (Date.now()) al tomar el snapshot: las entidades se interpolan con él, no con la hora de llegada. */
   t?: number;
@@ -118,10 +184,48 @@ export interface WorldSnapshot {
   tapes: number;
   /** Jugadores a los que una entidad inspecciona ahora en su nicho (hay que contener la respiración). */
   insp?: string[];
+  /** Objetos soltados que hay ahora en el suelo (ids `d…`); los pickups del cliente se sincronizan con esta lista. */
+  drops?: Drop[];
+  /** Índices (de tvSites) de las televisiones ya apagadas; solo con la misión «TURN OFF THE TVS». */
+  tvOff?: number[];
 }
 
+/** Consola de admin (solo la cuenta ADMIN_USER; el servidor lo comprueba en cada llamada). `t`: 'me', 'all' o el id de un jugador de la sala. */
+export type AdminAction =
+  | { a: 'level'; id: string; seed?: number }
+  | { a: 'run'; t: string }
+  | { a: 'lobby' }
+  | { a: 'kill' | 'revive' | 'heal'; t: string }
+  | { a: 'god'; t: string; on: boolean }
+  | { a: 'ammo'; t: string; on: boolean }
+  | { a: 'tp'; t: string; to: 'start' | 'elevator' | 'player'; who?: string }
+  | { a: 'money'; mode: 'add' | 'set'; n: number }
+  | { a: 'give'; t: string; item: ItemId }
+  | { a: 'mission' }
+  | { a: 'end'; ok: boolean }
+  | { a: 'tvs' }
+  | { a: 'ent'; op: 'spawn' | 'clear' | 'freeze' | 'thaw'; kind?: Kind; near?: string }
+  | { a: 'info' };
+export interface AdminInfo {
+  seed: number;
+  levelId: string;
+  round: number;
+  phase: Phase;
+  elapsed: number;
+  bank: number;
+  mission: string;
+  ents: number;
+  frozen: boolean;
+  players: { id: string; name: string; hp: number; dead: boolean; god: boolean; ammo?: boolean }[];
+}
+export type AdminReply = { ok: boolean; error?: string; info?: AdminInfo };
+/** Efectos de admin que el servidor manda a un cliente (el resto de la consola usa los canales de siempre: room, dead, revived, inv...). */
+export type AdminFx = { k: 'tp'; x: number; y: number; z: number; yaw: number } | { k: 'give'; item: ItemId } | { k: 'heal' } | { k: 'ammo'; on: boolean };
+
 export interface ClientToServer {
-  create: (a: { name: string; public: boolean }, cb: (r: Joined) => void) => void;
+  /** Consola de admin: el servidor rechaza (ok = false) a cualquiera que no sea la cuenta de admin. */
+  admin: (a: AdminAction, cb?: (r: AdminReply) => void) => void;
+  create: (a: { name: string; public: boolean; difficulty?: Difficulty }, cb: (r: Joined) => void) => void;
   /** El propietario cambia los ajustes (solo en el lobby). */
   settings: (patch: Partial<RoomSettings>) => void;
   join: (a: { code: string; name: string }, cb: (r: Joined) => void) => void;
@@ -133,16 +237,60 @@ export interface ClientToServer {
   pickup: (itemId: string, cb?: (ok: boolean) => void) => void;
   /** Un disparo que acierta a una entidad: el servidor decide si muere. */
   hit: (entityId: number) => void;
+  /** Fuego amigo: el tiro del rifle dio a este compañero. */
+  shoot: (playerId: string) => void;
   /** Se ha caído al vacío. */
   fell: () => void;
   chat: (text: string) => void;
   leave: () => void;
-  /** Ha llegado a la salida. */
-  exit: () => void;
+  /**
+   * Ha entrado en el ascensor abierto (la misión está cumplida) y sube. Manda lo que lleva: el servidor lo acota a lo que podía tener
+   * (inventario del inicio + lo recogido, menos lo soltado) y es lo que conserva para la siguiente ronda.
+   */
+  ascend: (inv: Inventory) => void;
+  /** Votación (fase `starting`, tras la entrada): votar una misión por su id (cambia el voto anterior; '' lo quita). */
+  vote: (missionId: string) => void;
+  /**
+   * Lobby: comprar un objeto en el ordenador con el dinero común. Va al inventario de quien compra. `error` en inglés si no se puede
+   * (NOT ENOUGH MONEY, ALREADY HAVE IT, TOO FAST, ...).
+   */
+  buy: (item: ItemId, cb?: (r: { ok: boolean; error?: string }) => void) => void;
+  /** Partida: soltar una unidad del objeto delante de uno (el servidor comprueba que lo llevaba); se ve en `world.drops` y se recoge con `pickup`. */
+  drop: (item: ItemId, cb?: (ok: boolean) => void) => void;
+  /** Partida, misión de las televisiones: apagar la número `index` (de tvSites); el servidor mira la distancia. */
+  tv: (index: number, cb?: (ok: boolean) => void) => void;
+  /** Usar el Tótem de la vida con un compañero caído: el servidor comprueba que lo tenía y que el otro está muerto. */
+  totem: (target: string, cb?: (ok: boolean) => void) => void;
+  /** El caído ha llegado a la meta de «Run for your life» (el servidor mira que haya pasado el tiempo mínimo). */
+  runDone: () => void;
+  /** El caído ha fallado «Run for your life» (solo hay una oportunidad): vuelve a estar muerto. */
+  runFail: () => void;
+  /** La cordura ha llegado a cero: muere (el servidor solo comprueba que está vivo y en partida). */
+  insane: () => void;
+  /** Se ha bebido una lata de Almond Water (el servidor comprueba que la tenía y devuelve la vida). */
+  drink: () => void;
   /** Se ha sacado una foto (el servidor cuenta las que valen, solo con cámara en la mano). */
   photo: () => void;
   /** Solo invitados: su color (uno de los gratis). Con cuenta, el aspecto sale de la cuenta. */
   look: (color: string) => void;
+  /** Listo / no listo en la sala de espera. En la fase `starting` (votación): `true` = este cliente ya tiene el nivel cargado. */
+  ready: (on: boolean) => void;
+  /** Terminar un tramo de cinta (el servidor le pone id y dueño y lo reparte). */
+  strip: (pts: number[]) => void;
+  /** Quitar un tramo (el de cualquiera). */
+  unstrip: (id: string) => void;
+  /** Pistola de agua: un chorro desde (x, z) mirando a `yaw` (unos 20 mensajes/s como mucho mientras dispara). El servidor busca a quién moja. */
+  squirt: (a: SquirtMsg) => void;
+}
+export interface SquirtMsg {
+  x: number;
+  z: number;
+  yaw: number;
+}
+/** Efecto de la pistola de agua sobre ti: `wet` = velocidad x0,5 durante `ms`; `stun` = parado `ms`. */
+export interface WetMsg {
+  kind: 'wet' | 'stun';
+  ms: number;
 }
 /** Lo que dice el servidor de sí mismo (GET /status): si está en mantenimiento y por qué. */
 export interface Status {
@@ -153,13 +301,34 @@ export interface Status {
 }
 
 export interface ServerToClient {
+  adminFx: (m: AdminFx) => void;
   status: (s: Status) => void;
   room: (r: RoomView) => void;
   players: (all: Record<string, PlayerState & { name: string; dead: boolean }>) => void;
   world: (w: WorldSnapshot) => void;
   chat: (m: { id: string; name: string; text: string }) => void;
   dead: (id: string) => void;
-  over: (r: { won: boolean }) => void;
+  /** Fin de la ronda (todos vuelven al lobby): el resultado completo (cobro o penalización, saldo, qué fue de cada uno). */
+  over: (r: RoundResult) => void;
+  /**
+   * Tu inventario según el servidor (solo para ti): al entrar en la sala, tras comprar o recoger, al empezar la ronda (lo que hay que cargar
+   * en el jugador) y al volver al lobby (lo conservado o perdido).
+   */
+  inv: (i: Inventory) => void;
   /** El servidor te ha concedido un logro (clave de ACHIEVEMENTS). */
   achievement: (key: string) => void;
+  /** Un caído empieza «Run for your life» por el Tótem de `by`. */
+  reviving: (m: { id: string; name: string; by: string }) => void;
+  /** Ha vuelto a la partida en (x, y, z), con la vida llena e inmune REVIVE_IMMUNE ms. */
+  revived: (m: { id: string; name: string; x: number; y: number; z: number; yaw: number }) => void;
+  /** El caído ha fallado la carrera y sigue muerto. */
+  runFailed: (m: { id: string; name: string }) => void;
+  /** Un tramo de cinta nuevo. */
+  strip: (s: Strip) => void;
+  /** Un tramo de cinta quitado (o los de quien se fue). */
+  unstrip: (id: string) => void;
+  /** Te ha mojado o parado alguien con la pistola de agua. */
+  wet: (m: WetMsg) => void;
+  /** Lo que hay soltado en el suelo de la sala de espera (la lista entera, cuando cambia). */
+  ldrops: (list: Drop[]) => void;
 }

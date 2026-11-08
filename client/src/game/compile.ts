@@ -1,3 +1,4 @@
+import { DEV_LOCAL } from '../devGate';
 import * as THREE from 'three';
 import { isStill } from './still';
 
@@ -12,7 +13,7 @@ const touched = () => {
 };
 if (typeof window !== 'undefined') for (const e of ['pointerdown', 'keydown', 'touchstart']) window.addEventListener(e, touched, { passive: true, capture: true });
 // desarrollo: &nopar hace como Firefox, sin compilación en paralelo
-if (typeof window !== 'undefined' && process.env.NODE_ENV === 'development' && new URLSearchParams(location.search).has('nopar')) {
+if (typeof window !== 'undefined' && DEV_LOCAL && new URLSearchParams(location.search).has('nopar')) {
   const get = WebGL2RenderingContext.prototype.getExtension;
   WebGL2RenderingContext.prototype.getExtension = function (this: WebGL2RenderingContext, n: string) {
     return n === 'KHR_parallel_shader_compile' ? null : get.call(this, n as 'OCULUS_multiview');
@@ -70,6 +71,6 @@ export async function compileGently(r: THREE.WebGLRenderer, scene: THREE.Scene, 
   await step(() => r.compileAsync(scene, cam));
   rt.dispose();
   // desarrollo: cuánto ha costado (en Firefox, sin compilación en paralelo, es casi todo bloqueo)
-  if (process.env.NODE_ENV === 'development')
+  if (DEV_LOCAL)
     console.info(`[compile] ${(r.info.programs?.length ?? 0) - stat.from} programas, ${Math.round(stat.busy)} ms bloqueando, ${Math.round(performance.now() - stat.at)} ms en total (${sync ? 'sin' : 'con'} paralelo)`);
 }

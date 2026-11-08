@@ -12,3 +12,7 @@ maintenance.json
 
 # base de datos local de las cuentas
 server/data/
+assets-src/
+# animaciones FBX originales de Mixamo: el juego usa el paquete (tools/anim_pack.mjs → client/public/animations/player.pack.*)
+client/public/animations/player/*.fbx
+assets-src/

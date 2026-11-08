@@ -7,12 +7,15 @@
  */
 
 export type Cell = { x: number; y: number };
-export type PropKind = 'vent' | 'socket' | 'armchair' | 'exit' | 'door';
+export type PropKind = 'vent' | 'socket' | 'armchair' | 'exit' | 'door' | 'cabinet' | 'shelf' | 'chair' | 'chair2' | 'desk' | 'crt' | 'lamp';
+/** Tipos de zona (cada sala tiene una; el resto, pasillos, es 0): el suelo y la luz cambian de tono para reconocerlas. */
+export const ZONE = { none: 0, pits: 1, hall: 2, cubicles: 3, office: 4, shelves: 5 } as const;
 export interface Maze {
   w: number;
   h: number; // en celdas de 1,5 m
   open: Uint8Array; // w*h, 1 = suelo, 0 = pared
   lit: Uint8Array; // w*h, 1 = zona con fluorescentes, 0 = zona apagada
+  zone: Uint8Array; // w*h, tipo de zona (ZONE)
   voids: Cell[]; // huecos al vacío (suelo abierto que no se pisa)
   start: Cell;
   elevator: Cell; // un callejón de una celda: la cabina
@@ -30,7 +33,15 @@ export interface Maze {
    */
   hides: { cell: Cell; side: number }[];
   /** Las salas grandes (informativo). */
-  rooms: { x: number; y: number; w: number; h: number }[];
+  rooms: { x: number; y: number; w: number; h: number; zone: number }[];
+  /** Dónde está el Tótem de la vida, si esta partida lo tiene (se pone con `totemSpot`, no lo trae generateMaze). */
+  totem?: Cell | null;
+  /** Poolrooms: latas de agua (ids w0...), pistola de agua (id p0) y tanque de buceo (id k0), puestos por poolMaze. */
+  waters?: Cell[];
+  watergun?: Cell | null;
+  tank?: Cell | null;
+  /** Poolrooms: w*h, 1 = lo que haya en esta celda (objeto, jabón, radar...) está en la planta ALTA (PoolMap.up); 0/ausente = planta baja. */
+  lay?: Uint8Array;
 }
 
 export const CELL = 1.5;
@@ -45,6 +56,9 @@ function mulberry32(a: number) {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
+
+/** Hay un panel de luz en el techo de esa celda: uno cada dos celdas (3 m) y, en las salas de pozos, el doble de densos. */
+export const hasPanel = (m: Pick<Maze, 'w' | 'zone'>, x: number, y: number) => (x % 2 === 0 && y % 2 === 0) || (x % 2 === 1 && y % 2 === 1 && m.zone[y * m.w + x] === ZONE.pits);
 
 /** Distancias por BFS desde `from` (-1 donde no se llega); `blocked` cuenta como pared. */
 export function bfs(m: Pick<Maze, 'w' | 'h' | 'open'>, from: Cell, blocked?: Set<number>) {
@@ -81,7 +95,9 @@ type Rect = { x: number; y: number; w: number; h: number };
 const area = (r: Rect) => r.w * r.h;
 
 function build(seed: number, n: number): Maze {
-  const rnd = mulberry32(seed), w = n, h = n, open = new Uint8Array(w * h), lit = new Uint8Array(w * h);
+  const rnd = mulberry32(seed), w = n, h = n, open = new Uint8Array(w * h), lit = new Uint8Array(w * h), zone = new Uint8Array(w * h);
+  const gridVoids: Cell[] = []; // los fosos de las salas de pozos
+  const nooks: { cell: Cell; side: number; kind: 'desk' }[] = []; // los cubículos: celda y lado de la pared del fondo
   const at = (x: number, y: number) => y * w + x;
   const int = (a: number, b: number) => a + ((rnd() * (b - a + 1)) | 0); // entero en [a, b]
   const pick = <T,>(a: T[]) => a[(rnd() * a.length) | 0];
@@ -124,19 +140,6 @@ function build(seed: number, n: number): Maze {
         if (cross) DIRS.forEach(([dx, dy]) => wall(x + dx, y + dy)); // columnas en cruz
       }
   };
-  const stripes = (r: Rect) => {
-    // tiras de 2 celdas a lo largo del lado mayor; cada muro con dos o tres huecos de 3 celdas
-    const along = r.w >= r.h;
-    const span = along ? r.h : r.w, len = along ? r.w : r.h;
-    for (let k = 2; k < span - 1; k += 3) {
-      for (let i = 0; i < len; i++) along ? wall(r.x + i, r.y + k) : wall(r.x + k, r.y + i);
-      const gaps = 2 + (rnd() < 0.5 ? 1 : 0);
-      for (let g = 0; g < gaps; g++) {
-        const i = int(0, len - 3);
-        for (let q = 0; q < 3; q++) open[along ? at(r.x + i + q, r.y + k) : at(r.x + k, r.y + i + q)] = 1;
-      }
-    }
-  };
   const office = (r: Rect, depth = 0): void => {
     // cuartos pequeños: se parte en dos con un muro y una puerta, hasta cuartos de 3–6 celdas
     const big = Math.max(r.w, r.h);
@@ -176,36 +179,92 @@ function build(seed: number, n: number): Maze {
     }
   };
 
+  // sala de pozos: suelo con una rejilla de fosos de 3×3 celdas separados por pasarelas de una (r.w y r.h = 4k+1:
+  // el borde y cada cuarta fila quedan de suelo y todo se alcanza). `bridge`: un campo de fosos con un puente en cruz
+  const pitGrid = (r: Rect, bridge: boolean) => {
+    for (let y = r.y + 1; y < r.y + r.h - 1; y++)
+      for (let x = r.x + 1; x < r.x + r.w - 1; x++) {
+        const ox = x - r.x, oy = y - r.y;
+        const hole = bridge ? ox >= 2 && ox <= r.w - 3 && oy >= 2 && oy <= r.h - 3 && ox !== r.w >> 1 && oy !== r.h >> 1 : ox % 4 !== 0 && oy % 4 !== 0;
+        if (hole) gridVoids.push({ x, y });
+      }
+  };
+  // cubículos: filas de tabiques cada dos celdas contra un muro de fondo, de dos en dos (abiertos a un pasillo de 2 celdas)
+  const cubicles = (r: Rect) => {
+    for (let y0 = r.y + 1; y0 + 5 <= r.y + r.h - 2; y0 += 6)
+      for (let x = r.x + 1; x < r.x + r.w - 1; x++) {
+        const part = (x - r.x - 1) % 2 === 0;
+        for (const [wy, py, side] of [[y0, y0 + 1, 3], [y0 + 5, y0 + 4, 2]] as const) {
+          wall(x, wy);
+          if (part) wall(x, py);
+          else nooks.push({ cell: { x, y: py }, side, kind: 'desk' });
+        }
+      }
+  };
+
   // 1. las salas: una enorme cerca del centro y el resto repartidas sin pisarse (a una celda de pared unas de otras,
   // o con un pasillo de por medio)
   const rooms: Rect[] = [];
   const sep = (a: Rect, b: Rect, pad: number) => a.x - pad >= b.x + b.w || b.x - pad >= a.x + a.w || a.y - pad >= b.y + b.h || b.y - pad >= a.y + a.h;
   const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-  const bw = int(18, 22), bh = int(14, 17);
-  rooms.push({ x: clamp(((n - bw) >> 1) + int(-4, 4), 1, n - 1 - bw), y: clamp(((n - bh) >> 1) + int(-4, 4), 1, n - 1 - bh), w: bw, h: bh });
+  const bw = int(14, 17), bh = int(11, 13);
+  rooms.push({ x: clamp(((n - bw) >> 1) + int(-3, 3), 1, n - 1 - bw), y: clamp(((n - bh) >> 1) + int(-3, 3), 1, n - 1 - bh), w: bw, h: bh });
   let filled = bw * bh;
-  for (let i = 0; i < 700 && filled < 0.46 * (n - 2) * (n - 2); i++) {
-    let rw = int(9, 20), rh = int(7, 15);
+  // las salas de pozos (una o dos), de lados impares
+  const pits = new Set<number>();
+  for (let k = 0; k < 1; k++)
+    for (let i = 0; i < 80; i++) {
+      let rw = 4 * int(3, 4) + 1, rh = 4 * int(2, 3) + 1;
+      if (rnd() < 0.5) [rw, rh] = [rh, rw];
+      const r = { x: int(1, n - 1 - rw), y: int(1, n - 1 - rh), w: rw, h: rh };
+      if (!rooms.every((o) => sep(r, o, 2))) continue;
+      pits.add(rooms.length);
+      rooms.push(r);
+      filled += area(r);
+      break;
+    }
+  for (let i = 0; i < 700 && filled < 0.5 * (n - 2) * (n - 2); i++) {
+    let rw = int(8, 15), rh = int(6, 11);
     if (rnd() < 0.5) [rw, rh] = [rh, rw];
     const r = { x: int(1, n - 1 - rw), y: int(1, n - 1 - rh), w: rw, h: rh }, pad = rnd() < 0.55 ? 1 : int(3, 5);
     if (!rooms.every((o) => sep(r, o, pad))) continue;
     rooms.push(r);
     filled += area(r);
   }
-  const roomLit: number[] = [];
+  const roomLit: number[] = [], roomZone: number[] = [];
   rooms.forEach((r, i) => {
     fill(r, 1);
     const huge = i === 0 || (r.w >= 18 && r.h >= 14);
-    // en L: se le quita una esquina
-    if (!huge && r.w >= 11 && r.h >= 9 && rnd() < 0.25) {
-      const cw = int((r.w * 0.35) | 0, (r.w * 0.5) | 0), ch = int((r.h * 0.35) | 0, (r.h * 0.5) | 0);
-      fill({ x: rnd() < 0.5 ? r.x : r.x + r.w - cw, y: rnd() < 0.5 ? r.y : r.y + r.h - ch, w: cw, h: ch }, 0);
+    let z: number = ZONE.none;
+    if (pits.has(i)) {
+      pitGrid(r, rnd() < 0.3);
+      z = ZONE.pits;
+    } else {
+      // en L: se le quita una esquina
+      if (!huge && r.w >= 11 && r.h >= 9 && rnd() < 0.2) {
+        const cw = int((r.w * 0.35) | 0, (r.w * 0.5) | 0), ch = int((r.h * 0.35) | 0, (r.h * 0.5) | 0);
+        fill({ x: rnd() < 0.5 ? r.x : r.x + r.w - cw, y: rnd() < 0.5 ? r.y : r.y + r.h - ch, w: cw, h: ch }, 0);
+      }
+      const hallZ = (f: () => void) => () => (f(), (z = ZONE.hall));
+      const office_ = () => (office(r), (z = ZONE.office));
+      const cub = () => (cubicles(r), (z = ZONE.cubicles));
+      if (huge) pick([hallZ(() => pillars(r, 4)), hallZ(() => (pillars(r, 4), hall(r, 90))), hallZ(() => pillars(r, 5)), hallZ(() => hall(r, 60))])();
+      else {
+        // el resto: según el tamaño, de todo un poco (se reconocen por la forma y por el tono de la luz)
+        const opts: (() => unknown)[] = [hallZ(() => pillars(r)), hallZ(() => hall(r, 25)), office_];
+        if (area(r) >= 12 * 9) opts.push(hallZ(() => pillars(r, 4)), hallZ(() => (pillars(r, 4), hall(r, 70))));
+        if (r.w >= 7 && r.h >= 8) opts.push(cub, cub, cub);
+        pick(opts)();
+      }
     }
-    if (huge) pick([() => pillars(r, 4), () => (pillars(r, 4), hall(r, 90)), () => pillars(r, 5), () => hall(r, 60)])();
-    else if (area(r) < 12 * 9) pick([() => office(r), () => office(r), () => pillars(r), () => hall(r, 25)])();
-    else pick([() => pillars(r), () => pillars(r, 4), () => hall(r), () => hall(r, 30), () => (pillars(r, 4), hall(r, 70)), () => stripes(r), () => office(r)])();
-    roomLit.push(rnd() < (huge ? 0.9 : 0.8) ? 1 : 0); // alguna sala entera apagada
-    for (let y = r.y; y < r.y + r.h; y++) for (let x = r.x; x < r.x + r.w; x++) lit[at(x, y)] = roomLit[i];
+    // zonas apagadas: pocas y solo en salas pequeñas
+    roomLit.push(z === ZONE.pits || rnd() < (area(r) >= 70 ? 0.97 : 0.85) ? 1 : 0);
+    roomZone.push(z);
+    for (let y = r.y; y < r.y + r.h; y++)
+      for (let x = r.x; x < r.x + r.w; x++) {
+        lit[at(x, y)] = roomLit[i];
+        zone[at(x, y)] = z;
+      }
   });
 
   // 2. las uniones: un árbol (para que todas se alcancen), algunos ciclos y alguna recta larga; entre salas
@@ -240,7 +299,7 @@ function build(seed: number, n: number): Maze {
       }
     }
     // en diagonal (o sin sitio): un pasillo en L de centro a centro
-    const ca = ctr(a), cb = ctr(b), ww = rnd() < 0.3 ? 2 : 1;
+    const ca = ctr(a), cb = ctr(b), ww = rnd() < 0.5 ? 2 : 1;
     const hline = (xa: number, xb: number, y: number) => {
       for (let x = Math.min(xa, xb); x <= Math.max(xa, xb); x++) for (let k = 0; k < ww; k++) carve(x, y + k, on);
     };
@@ -263,7 +322,7 @@ function build(seed: number, n: number): Maze {
   for (const [i, j] of pairs) {
     const adj = gapOf(rooms[i], rooms[j]) <= 6;
     if (find(i) !== find(j)) (grp[find(i)] = find(j)), linked.add(i * rooms.length + j), link(i, j);
-    else if ((adj && rnd() < 0.45) || (dd([i, j]) < 34 && rnd() < 0.05)) linked.add(i * rooms.length + j), link(i, j);
+    else if ((adj && rnd() < 0.7) || (dd([i, j]) < 30 && rnd() < 0.15)) linked.add(i * rooms.length + j), link(i, j);
   }
   // alguna recta larga: dos salas alineadas con nada en medio, y un pasillo de una a otra
   for (const [i, j] of shuffle(pairs.filter(([i, j]) => !linked.has(i * rooms.length + j) && gapOf(rooms[i], rooms[j]) >= 9))) {
@@ -278,10 +337,11 @@ function build(seed: number, n: number): Maze {
     break;
   }
 
-  // el inicio: el suelo más cerca de la esquina; lo que no se alcanza desde él se tapia
+  // el inicio: el suelo más cerca de la esquina (no un foso); lo que no se alcanza desde él se tapia
+  const isPit = new Set(gridVoids.map((c) => at(c.x, c.y)));
   let start: Cell = { x: 1, y: 1 };
   for (let s = 2; s < w + h; s++) {
-    const c = Array.from({ length: s - 1 }, (_, i) => ({ x: 1 + i, y: s - 1 - i })).find((c) => c.x < w - 1 && c.y < h - 1 && open[at(c.x, c.y)]);
+    const c = Array.from({ length: s - 1 }, (_, i) => ({ x: 1 + i, y: s - 1 - i })).find((c) => c.x < w - 1 && c.y < h - 1 && open[at(c.x, c.y)] && zone[at(c.x, c.y)] !== ZONE.pits);
     if (c) {
       start = c;
       break;
@@ -303,7 +363,7 @@ function build(seed: number, n: number): Maze {
       const opens = DIRS.filter(([dx, dy]) => open[at(x + dx, y + dy)]);
       if (opens.length !== 1) continue;
       const [dx, dy] = opens[0], o = d0[at(x + dx, y + dy)];
-      if (o < 0) continue;
+      if (o < 0 || zone[at(x + dx, y + dy)] === ZONE.pits) continue;
       if (o > best) (best = o), (elevator = { x, y });
     }
   open[at(elevator.x, elevator.y)] = 1;
@@ -315,9 +375,10 @@ function build(seed: number, n: number): Maze {
   const reach = (blocked: Set<number>) => bfs(m, start, blocked).reduce((s, v) => s + (v >= 0 ? 1 : 0), 0);
 
   // huecos al vacío: en sitios abiertos (4 vecinos) y lejos del inicio y del ascensor, sin desconectar nada
-  const blocked = new Set<number>(), voids: Cell[] = [];
+  const blocked = new Set<number>(isPit), voids: Cell[] = [...gridVoids];
   for (const c of shuffle([...cells])) {
-    if (voids.length >= 5 + ((seed >>> 3) & 1) * 3) break;
+    if (voids.length - gridVoids.length >= 2 + ((seed >>> 3) & 1) * 2) break;
+    if (zone[at(c.x, c.y)] === ZONE.pits) continue;
     // en pleno suelo (los ocho vecinos abiertos: en una sala, no en un pasillo)
     if (nOpen(c) < 4 || !open[at(c.x + 1, c.y + 1)] || !open[at(c.x - 1, c.y - 1)] || !open[at(c.x + 1, c.y - 1)] || !open[at(c.x - 1, c.y + 1)]) continue;
     if (near(c, start, 10) || near(c, elevator, 6) || voids.some((v) => near(v, c, 10))) continue;
@@ -350,17 +411,17 @@ function build(seed: number, n: number): Maze {
     mark(c);
   }
   // la pistola, a veces, en un rincón (dos paredes al lado) lejos del inicio
-  const corners = free.filter((c) => nOpen(c) <= 2 && dist(c) >= 18 && !used.has(at(c.x, c.y)));
+  const corners = free.filter((c) => nOpen(c) <= 2 && dist(c) >= 14 && !used.has(at(c.x, c.y)));
   const pistol = rnd() < 0.5 && corners.length ? take(pick(corners)) : null;
   // los arranques de las entidades: lejos del inicio y separados entre sí
   const spawns: Cell[] = [];
   for (const c of [...free].sort((a, b) => dist(b) - dist(a))) {
     if (spawns.length === 8) break;
-    if (dist(c) < 18 || used.has(at(c.x, c.y)) || near(c, elevator, 3) || spawns.some((s) => near(s, c, 12))) continue;
+    if (dist(c) < 14 || used.has(at(c.x, c.y)) || near(c, elevator, 3) || spawns.some((s) => near(s, c, 9))) continue;
     spawns.push(c);
   }
   // los fluorescentes: uno cada dos celdas (3 m) en las zonas encendidas, uno de cada nueve fundido
-  const lamps = cells.filter((c) => c.x % 2 === 0 && c.y % 2 === 0 && lit[at(c.x, c.y)] && rnd() > 1 / 9);
+  const lamps = cells.filter((c) => hasPanel({ w, zone }, c.x, c.y) && lit[at(c.x, c.y)] && rnd() > (zone[at(c.x, c.y)] === ZONE.pits ? 1 / 30 : 1 / 14));
   // detalles: rejillas en el techo, enchufes y puertas falsas en las paredes, sillones en las salas
   const props: Maze['props'] = [];
   const wallSide = (c: Cell) => DIRS.findIndex(([dx, dy]) => !open[at(c.x + dx, c.y + dy)]);
@@ -370,16 +431,34 @@ function build(seed: number, n: number): Maze {
     if (r < 0.025 && c.x % 2 && c.y % 2) props.push({ cell: c, kind: 'vent', rot: 0 });
     else if (r < 0.05 && wallSide(c) >= 0) props.push({ cell: c, kind: 'socket', rot: wallSide(c) });
     else if (r < 0.058 && wallSide(c) >= 0) props.push({ cell: c, kind: 'door', rot: wallSide(c) });
-    else if (r < 0.064 && nOpen(c) === 4) props.push({ cell: c, kind: 'armchair', rot: (rnd() * 4) | 0 });
+    else if (r >= 0.058 && r < 0.066 && nOpen(c) === 4 && zone[at(c.x, c.y)] !== ZONE.pits) props.push({ cell: c, kind: 'armchair', rot: (rnd() * 4) | 0 });
+  }
+  // el mobiliario, por zonas, contra la pared (`rot` = lado de la pared): cubículos con mesa, silla y tele o lámpara, archivadores en las
+  // oficinas, estantes en las naves de estantería y algo suelto en el resto. Nunca sobre objetos, arranques ni fosos, ni en pasillos.
+  const spawnAt = new Set(spawns.map((c) => at(c.x, c.y)));
+  const taken = new Set(props.map((p) => at(p.cell.x, p.cell.y)));
+  const okCell = (c: Cell) => open[at(c.x, c.y)] && !used.has(at(c.x, c.y)) && !spawnAt.has(at(c.x, c.y)) && !blocked.has(at(c.x, c.y)) && !taken.has(at(c.x, c.y));
+  const put = (c: Cell, kind: PropKind, rot: number) => (props.push({ cell: c, kind, rot }), taken.add(at(c.x, c.y)));
+  const desk = (c: Cell, side: number) => {
+    put(c, 'desk', side);
+    const k = rnd();
+    if (k < 0.45) props.push({ cell: c, kind: 'crt', rot: side });
+    if (k < 0.8) props.push({ cell: c, kind: rnd() < 0.5 ? 'chair' : 'chair2', rot: (rnd() * 4) | 0 });
+  };
+  for (const q of nooks) if (okCell(q.cell) && rnd() < 0.7) desk(q.cell, q.side);
+  for (const c of free) {
+    const z = zone[at(c.x, c.y)], side = wallSide(c), r = rnd();
+    if (side < 0 || nOpen(c) < 3 || z === ZONE.pits || z === ZONE.cubicles || !okCell(c)) continue;
+    if (r > 0.97) desk(c, side), taken.add(at(c.x, c.y));
   }
   // las linternas sueltas: una no muy lejos del inicio (para ver pronto que se gastan) y el resto repartidas por el mapa
   const flashlights: Cell[] = [];
   const spare = shuffle(free.filter((c) => !used.has(at(c.x, c.y))));
-  const first = spare.find((c) => dist(c) >= 10 && dist(c) <= 24);
+  const first = spare.find((c) => dist(c) >= 8 && dist(c) <= 18);
   if (first) flashlights.push(take(first));
   for (const c of spare) {
     if (flashlights.length >= 6) break;
-    if (used.has(at(c.x, c.y)) || flashlights.some((l) => near(l, c, 12))) continue;
+    if (used.has(at(c.x, c.y)) || flashlights.some((l) => near(l, c, 10))) continue;
     flashlights.push(take(c));
   }
   // los escondites: nichos de una celda en una pared lisa (a los lados de su boca, suelo), uno por cada ~125 celdas,
@@ -398,12 +477,12 @@ function build(seed: number, n: number): Maze {
       mouths.push({ c: { x, y }, side });
     }
   for (const k of shuffle(mouths)) {
-    if (hides.length >= Math.max(3, Math.round(cells.length / 125))) break;
-    if (hides.every((q) => !near(q.cell, k.c, 14))) hides.push({ cell: k.c, side: k.side });
+    if (hides.length >= Math.max(3, Math.round(cells.length / 100))) break;
+    if (hides.every((q) => !near(q.cell, k.c, 12))) hides.push({ cell: k.c, side: k.side });
   }
   // la salida: el cartel encima del ascensor, en su lado abierto
   props.push({ cell: elevator, kind: 'exit', rot: DIRS.findIndex(([dx, dy]) => open[at(elevator.x + dx, elevator.y + dy)]) });
-  return { w, h, open, lit, voids, start, elevator, camera, pistol, extraGuns: [], tapes, flashlights, spawns, lamps, props, hides, rooms };
+  return { w, h, open, lit, zone, voids, start, elevator, camera, pistol, extraGuns: [], tapes, flashlights, spawns, lamps, props, hides, rooms: rooms.map((r, i) => ({ ...r, zone: roomZone[i] })) };
 }
 
 /**
@@ -452,11 +531,11 @@ function supply(m: Maze, seed: number, players: number) {
 }
 
 /** Lo que mide el recorrido bueno (celdas): partidas de 7–10 min. */
-const ROUTE = [240, 400] as const;
+const ROUTE = [160, 270] as const;
 /** Rejilla más pequeña y más grande (celdas de lado): las salas abiertas piden más sitio para el mismo recorrido. */
-const N_MIN = 52, N_MAX = 84;
+const N_MIN = 38, N_MAX = 60;
 function base(seed: number): Maze {
-  let n = 66, best: Maze | undefined, bestErr = Infinity;
+  let n = 46, best: Maze | undefined, bestErr = Infinity;
   for (let i = 0; i < 8; i++) {
     const m = build(seed, n), len = routeLength(m);
     const err = len < ROUTE[0] ? ROUTE[0] - len : len > ROUTE[1] ? len - ROUTE[1] : 0;
@@ -464,5 +543,5 @@ function base(seed: number): Maze {
     if (!err) break;
     n = Math.max(N_MIN, Math.min(N_MAX, n + (len < ROUTE[0] ? 4 : -4)));
   }
-  return best ?? build(seed, 66);
+  return best ?? build(seed, 46);
 }

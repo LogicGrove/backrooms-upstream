@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { hash, verify } from '@node-rs/argon2';
 import {
-  ACHIEVEMENT_KEYS, BODY_MAX, CLIENT_PORT, COSMETICS, PASS_MAX, PASS_MIN, USER_RE, cosmetic, lookAllowed,
+  ACHIEVEMENT_KEYS, ADMIN_USER, AVATAR_MAX, AVATAR_PX, AVATAR_TYPES, BODY_MAX, CLIENT_PORT, COSMETICS, PASS_MAX, PASS_MIN, USER_RE, cosmetic, lookAllowed,
   type Look, type Me, type Slot,
 } from '@backrooms/shared';
 import * as db from './db';
@@ -114,7 +114,8 @@ const MIN15 = 15 * 60_000;
 const loginIp = new Limiter(10, MIN15), loginUser = new Limiter(5, MIN15);
 const recoverIp = new Limiter(5, MIN15), recoverUser = new Limiter(5, MIN15);
 const registerIp = new Limiter(5, 3600_000);
-setInterval(() => [loginIp, loginUser, recoverIp, recoverUser, registerIp].forEach((l) => l.sweep()), 5 * 60_000).unref();
+const avatarUp = new Limiter(6, MIN15); // subidas de foto por cuenta
+setInterval(() => [loginIp, loginUser, recoverIp, recoverUser, registerIp, avatarUp].forEach((l) => l.sweep()), 5 * 60_000).unref();
 setInterval(db.purgeSessions, 3600_000).unref();
 
 /** La IP del cliente. Detrás de proxies de confianza (TRUST_PROXY = cuántos), la del X-Forwarded-For contando desde la derecha. */
@@ -159,10 +160,15 @@ function newSession(userId: number) {
   return sid;
 }
 
+/** ¿Es el nombre de la cuenta de admin? Comparación exacta (el nombre guardado es el que se escribió al registrarse). */
+export const isAdminName = (name: string) => name === ADMIN_USER;
+
 export function meOf(uid: number, username: string): Me {
   const achievements = db.achievementsOf(uid), have = new Set(Object.keys(achievements));
   return {
     username,
+    ...(isAdminName(username) ? { admin: true } : {}),
+    avatar: db.avatarRef(uid),
     achievements,
     stats: db.statsOf(uid),
     loadout: db.loadoutOf(uid),
@@ -206,6 +212,65 @@ function readBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   });
 }
 
+function readRaw(req: IncomingMessage, max: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    if (Number(req.headers['content-length'] ?? 0) > max) return reject(new HttpErr(413, 'Image too large'));
+    const parts: Buffer[] = [];
+    let n = 0;
+    req.on('data', (c: Buffer) => {
+      n += c.length;
+      if (n > max) return reject(new HttpErr(413, 'Image too large')), req.destroy();
+      parts.push(c);
+    });
+    req.on('error', () => reject(new HttpErr(400, 'Bad request')));
+    req.on('end', () => resolve(Buffer.concat(parts)));
+  });
+}
+
+/** Ancho y alto leídos de la cabecera del webp o del jpeg (null si no es uno válido): no se fía del Content-Type. */
+function imageSize(b: Buffer, mime: string): [number, number] | null {
+  try {
+    if (mime === 'image/webp') {
+      if (b.length < 30 || b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WEBP') return null;
+      const t = b.toString('latin1', 12, 16);
+      if (t === 'VP8 ') return [b.readUInt16LE(26) & 0x3fff, b.readUInt16LE(28) & 0x3fff];
+      if (t === 'VP8L') return [(b.readUInt32LE(21) & 0x3fff) + 1, ((b.readUInt32LE(21) >> 14) & 0x3fff) + 1];
+      if (t === 'VP8X') return [b.readUIntLE(24, 3) + 1, b.readUIntLE(27, 3) + 1];
+      return null;
+    }
+    if (b[0] !== 0xff || b[1] !== 0xd8) return null;
+    for (let i = 2; i + 9 < b.length && b[i] === 0xff; i += 2 + b.readUInt16BE(i + 2)) {
+      const m = b[i + 1];
+      if (m >= 0xc0 && m <= 0xcf && m !== 0xc4 && m !== 0xc8 && m !== 0xcc) return [b.readUInt16BE(i + 7), b.readUInt16BE(i + 5)];
+    }
+  } catch {}
+  return null;
+}
+
+/** Subir la foto de perfil: el cuerpo es la imagen tal cual (webp o jpeg). Solo el dueño (su sesión), con límite de tasa. */
+async function uploadAvatar(req: IncomingMessage): Promise<Out> {
+  const s = userFromCookie(req.headers.cookie);
+  if (!s) throw new HttpErr(401, 'Not signed in');
+  const key = String(s.user.id), w = avatarUp.wait(key);
+  if (w) throw new HttpErr(429, TOO_MANY, { 'retry-after': String(Math.ceil(w / 1000)) });
+  avatarUp.fail(key);
+  const mime = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  if (!AVATAR_TYPES.includes(mime)) throw new HttpErr(415, 'Use a WebP or JPEG image');
+  const buf = await readRaw(req, AVATAR_MAX);
+  const dim = imageSize(buf, mime);
+  if (!dim || dim.some((v) => v < 16 || v > AVATAR_PX * 2)) throw new HttpErr(400, 'Invalid image');
+  db.saveAvatar(s.user.id, mime, buf);
+  hooks.loadout(s.user.id); // si está en una sala, su foto se refresca para todos
+  return { body: { me: meOf(s.user.id, s.user.username) } };
+}
+function removeAvatar(req: IncomingMessage): Out {
+  const s = userFromCookie(req.headers.cookie);
+  if (!s) throw new HttpErr(401, 'Not signed in');
+  db.deleteAvatar(s.user.id);
+  hooks.loadout(s.user.id);
+  return { body: { me: meOf(s.user.id, s.user.username) } };
+}
+
 const str = (v: unknown, max: number) => (typeof v === 'string' && v.length <= max ? v : '');
 
 type Out = { status?: number; body: unknown; cookie?: string };
@@ -216,6 +281,8 @@ async function register(req: IncomingMessage, b: Record<string, unknown>): Promi
   const username = str(b.username, 64), password = typeof b.password === 'string' ? b.password : '';
   if (!USER_RE.test(username)) throw new HttpErr(400, 'Username must be 3-16 letters, numbers or _');
   if (password.length < PASS_MIN || password.length > PASS_MAX) throw new HttpErr(400, `Password must be ${PASS_MIN}-${PASS_MAX} characters`);
+  // nadie registra variantes (S7LVER, s7Lver...) del nombre de admin: solo el nombre exacto, y los nombres son únicos sin mayúsculas (username_lower)
+  if (username.toLowerCase() === ADMIN_USER && username !== ADMIN_USER) throw new HttpErr(409, 'Username taken');
   registerIp.fail(ip); // cada intento cuenta (5 cuentas por hora y por IP)
   if (db.userByName(username)) throw new HttpErr(409, 'Username taken');
   const code = newRecovery();
@@ -277,6 +344,8 @@ function loadout(req: IncomingMessage, b: Record<string, unknown>): Out {
 function importLegacy(req: IncomingMessage, b: Record<string, unknown>): Out {
   const s = userFromCookie(req.headers.cookie);
   if (!s) throw new HttpErr(401, 'Not signed in');
+  // el cliente solo AFIRMA haberlos ganado (localStorage): cualquiera con cuenta pediría `first_escape` e `idiot` gratis. Cerrado salvo LEGACY_IMPORT=1 (migración puntual)
+  if (process.env.LEGACY_IMPORT !== '1') return { body: { me: meOf(s.user.id, s.user.username) } };
   const list = Array.isArray(b.keys) ? b.keys.slice(0, 8) : [];
   const map: Record<string, string> = { backrooms: 'first_escape', idiot: 'idiot' };
   for (const k of list) if (typeof k === 'string' && map[k] && ACHIEVEMENT_KEYS.has(map[k])) award(s.user.id, map[k]);
@@ -306,8 +375,26 @@ export function handleApi(req: IncomingMessage, res: ServerResponse): boolean {
         const extra: Record<string, string> = s?.slid ? { 'set-cookie': cookieStr(s.sid, SESSION_TTL / 1000) } : {};
         return send(res, 200, { me: s ? meOf(s.user.id, s.user.username) : null }, { ...cors, ...extra });
       }
+      // la foto de cualquiera es pública (como su nombre en la sala); la URL lleva la versión, así que se cachea para siempre
+      const av = req.method === 'GET' ? /^\/api\/avatar\/(\d{1,9})$/.exec(path) : null;
+      if (av) {
+        const a = db.avatarOf(Number(av[1]));
+        if (!a) throw new HttpErr(404, 'Not found');
+        const etag = `"${a.updated_at}"`;
+        const h = {
+          'content-type': a.mime, etag, 'x-content-type-options': 'nosniff', 'content-security-policy': "default-src 'none'; sandbox", 'cross-origin-resource-policy': 'cross-origin',
+          'cache-control': (req.url ?? '').includes('v=') ? 'public, max-age=31536000, immutable' : 'public, max-age=300', ...cors,
+        };
+        if (req.headers['if-none-match'] === etag) return void (res.writeHead(304, h), res.end());
+        return void (res.writeHead(200, { ...h, 'content-length': a.data.length }), res.end(Buffer.from(a.data)));
+      }
+      if (req.method === 'POST' && path === '/api/avatar') {
+        if (!ok) throw new HttpErr(403, 'Origin not allowed'); // anti CSRF: Origin permitido, y un Content-Type que un formulario ajeno no puede mandar
+        const out = await uploadAvatar(req);
+        return send(res, 200, out.body, cors);
+      }
       const routes: Record<string, (req: IncomingMessage, b: Record<string, unknown>) => Promise<Out> | Out> = {
-        '/api/register': register, '/api/login': login, '/api/recover': recover, '/api/loadout': loadout, '/api/import': importLegacy,
+        '/api/register': register, '/api/login': login, '/api/recover': recover, '/api/loadout': loadout, '/api/import': importLegacy, '/api/avatar-remove': removeAvatar,
       };
       const isPost = req.method === 'POST';
       if (path === '/api/logout' ? !isPost : !(path in routes && isPost)) throw new HttpErr(path in routes || path === '/api/logout' ? 405 : 404, 'Not found');

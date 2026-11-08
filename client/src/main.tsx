@@ -1,8 +1,12 @@
+import { DEV_LOCAL } from './devGate';
 import { createRoot } from 'react-dom/client';
 import './game/backrooms.css';
 import App from './App';
 
+// desarrollo: /?anim abre la herramienta de animaciones (árbol, bailes, variantes, IK; dev/AnimTool.tsx)
 // desarrollo: /?grips abre la herramienta para colocar los objetos en las manos (dev/GripTool.tsx)
-if (import.meta.env.DEV && new URLSearchParams(location.search).has('grips')) {
+if (DEV_LOCAL && new URLSearchParams(location.search).has('grips')) {
   import('./dev/GripTool').then(({ default: GripTool }) => createRoot(document.getElementById('root')!).render(<GripTool />));
+} else if (DEV_LOCAL && new URLSearchParams(location.search).has('anim')) {
+  import('./dev/AnimTool').then(({ default: AnimTool }) => createRoot(document.getElementById('root')!).render(<AnimTool />));
 } else createRoot(document.getElementById('root')!).render(<App />);

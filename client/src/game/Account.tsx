@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { ACHIEVEMENTS, PASS_MAX, PASS_MIN, USER_RE } from '@backrooms/shared';
-import { ApiError, type Account } from '../account';
+import { ApiError, avatarUrl, cropAvatar, type Account } from '../account';
 
 /*
  * Cuentas en el OSD de la cinta: inicio de sesión, registro (con el código de recuperación, que sale una sola vez),
@@ -173,6 +173,15 @@ export function AuthScreen({ acct, mode: first, onClose }: { acct: Account; mode
 
 export { AchievementsScreen } from './Achievements';
 
+/** La foto de perfil en un cuadrado (o, sin foto, la inicial). */
+export function Avatar({ src, name }: { src?: string; name?: string }) {
+  return (
+    <span className="br-avatar" aria-hidden="true">
+      {src ? <img src={src} alt="" draggable={false} /> : name ? name[0].toUpperCase() : '?'}
+    </span>
+  );
+}
+
 /** El popup de la cuenta (desde la cajita de la pantalla de título): quién eres y entrar, registrarse o salir. */
 export function AccountMenu({ acct, onAuth, onClose }: { acct: Account; onAuth: (m: AuthMode) => void; onClose: () => void }) {
   useEffect(() => {
@@ -181,20 +190,66 @@ export function AccountMenu({ acct, onAuth, onClose }: { acct: Account; onAuth: 
     return () => removeEventListener('keydown', key);
   }, [onClose]);
   const user = acct.me?.username;
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+  const file = useRef<HTMLInputElement>(null);
+  // la foto: se recorta y comprime aquí y se sube; el servidor lo vuelve a comprobar todo
+  const pick = async (f?: File) => {
+    if (!f || busy) return;
+    setErr('');
+    setBusy(true);
+    try {
+      await acct.setAvatar(await cropAvatar(f));
+    } catch (x) {
+      setErr(say(x));
+    } finally {
+      setBusy(false);
+      if (file.current) file.current.value = '';
+    }
+  };
+  const drop = async () => {
+    setErr('');
+    setBusy(true);
+    try {
+      await acct.removeAvatar();
+    } catch (x) {
+      setErr(say(x));
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <div className="br-dialog br-dialog--acct" role="dialog" aria-modal="true" aria-labelledby="br-acct-t">
       <div className="br-acctbox br-acctbox--static">
-        <span className="br-avatar" aria-hidden="true">{user ? user[0].toUpperCase() : '?'}</span>
+        <Avatar src={avatarUrl(acct.me?.avatar)} name={user} />
         <span>
           <span className="br-acctbox__n" id="br-acct-t">{user ?? 'GUEST'}</span>
           <span className="br-lobby__dim">{user ? 'SIGNED IN' : 'PROGRESS IS NOT SAVED'}</span>
         </span>
       </div>
+      {err && (
+        <p className="br-lobby__err" role="alert">
+          {err}
+        </p>
+      )}
       <ul className="br-lobby__opts">
         {user ? (
-          <li>
-            <button type="button" className="br-opt" onClick={() => (void acct.logout(), onClose())} autoFocus>SIGN OUT</button>
-          </li>
+          <>
+            <li>
+              <input ref={file} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={(e) => void pick(e.target.files?.[0])} />
+              <button type="button" className="br-opt" disabled={busy} onClick={() => file.current?.click()} autoFocus>
+                {busy ? 'WORKING…' : acct.me?.avatar ? 'CHANGE PHOTO' : 'ADD PHOTO'}
+              </button>
+            </li>
+            {acct.me?.avatar && (
+              <li>
+                <button type="button" className="br-opt" disabled={busy} onClick={drop}>REMOVE PHOTO</button>
+              </li>
+            )}
+            <li>
+              <button type="button" className="br-opt" onClick={() => (void acct.logout(), onClose())}>SIGN OUT</button>
+            </li>
+          </>
         ) : (
           <>
             <li>
@@ -218,7 +273,7 @@ export function AccountBox({ acct, onClick }: { acct: Account; onClick: () => vo
   const user = acct.me?.username;
   return (
     <button type="button" className="br-acctbox" onClick={onClick} aria-label="Account">
-      <span className="br-avatar" aria-hidden="true">{user ? user[0].toUpperCase() : '?'}</span>
+      <Avatar src={avatarUrl(acct.me?.avatar)} name={user} />
       <span>
         <span className="br-acctbox__n">{acct.status === 'loading' ? '…' : user ?? 'GUEST'}</span>
         <span className="br-lobby__dim">{acct.status === 'user' ? 'SIGNED IN' : acct.status === 'offline' ? 'SERVER OFFLINE' : acct.status === 'loading' ? 'CHECKING TAPE' : 'NOT SIGNED IN'}</span>

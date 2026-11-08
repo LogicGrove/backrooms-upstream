@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import type { Assets } from './game';
+import { clone as skClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { model } from './cosmetics';
+import { poolPart } from './poolmap';
 
 /*
  * Los iconos del inventario: capturas de los modelos del juego. Un renderer WebGL pequeño y desechable pinta cada
@@ -31,7 +33,7 @@ function setup() {
 function shoot(src: THREE.Object3D, spin = -0.7, tilt = 0.4) {
   const { r, scene, cam } = setup();
   const pivot = new THREE.Group();
-  pivot.add(src.clone(true));
+  pivot.add(skClone(src)); // (SkeletonUtils: el tótem lleva piel)
   pivot.rotation.set(tilt, spin, 0, 'YXZ');
   scene.add(pivot);
   pivot.updateMatrixWorld(true);
@@ -42,7 +44,12 @@ function shoot(src: THREE.Object3D, spin = -0.7, tilt = 0.4) {
   cam.top = half;
   cam.bottom = -half;
   cam.updateProjectionMatrix();
-  cam.position.set(c.x, c.y, c.z + 10);
+  // la cámara fuera del objeto, sea cual sea su escala (un modelo enorme, como la pistola de agua, quedaba cortado por el plano cercano)
+  const d = Math.max(s.x, s.y, s.z) * 1.5 + 1;
+  cam.near = d * 0.01;
+  cam.far = d * 4;
+  cam.updateProjectionMatrix();
+  cam.position.set(c.x, c.y, c.z + d);
   cam.lookAt(c);
   r.render(scene, cam);
   scene.remove(pivot);
@@ -57,10 +64,15 @@ function release() {
   rig = undefined;
 }
 
-export type IconKey = 'flashlight' | 'camera' | 'gun' | 'tape' | 'spare' | 'ammo';
+export type IconKey = 'flashlight' | 'camera' | 'gun' | 'tape' | 'spare' | 'ammo' | 'water' | 'caution' | 'radar' | 'totem' | 'watergun' | 'tank';
 
 /** Los iconos del equipo y de los bolsillos; se hacen la primera vez y se guardan. */
 export function gearIcons(assets: Assets): Record<IconKey, string> {
+  // lo de las Poolrooms llega cuando se baja su kit
+  for (const [k, spin] of [['watergun', -0.5], ['tank', -0.6]] as const) {
+    const o = poolPart(k);
+    if (o && !cache.has(k)) (cache.set(k, shoot(o, spin, 0.3)), release());
+  }
   if (!cache.has('flashlight')) {
     const g = assets.gltf;
     const flash = shoot(g.flashlight.scene, -0.9, 0.3);
@@ -71,9 +83,13 @@ export function gearIcons(assets: Assets): Record<IconKey, string> {
     cache.set('gun', gun);
     cache.set('ammo', gun);
     cache.set('tape', shoot(g.vhs.scene, -0.55, 0.5));
+    cache.set('water', shoot(g.water.scene, -0.5, 0.2));
     release();
+    cache.set('caution', shoot(g.duct.scene, -0.6, 0.5));
+    cache.set('radar', shoot(g.radar.scene, -0.4, 0.5));
+    cache.set('totem', shoot(g.totem.scene, -0.5, 0.2));
   }
-  return Object.fromEntries(['flashlight', 'camera', 'gun', 'tape', 'spare', 'ammo'].map((k) => [k, cache.get(k)!])) as Record<IconKey, string>;
+  return Object.fromEntries(['flashlight', 'camera', 'gun', 'tape', 'spare', 'ammo', 'water', 'caution', 'radar', 'totem', 'watergun', 'tank'].map((k) => [k, cache.get(k) ?? ''])) as Record<IconKey, string>;
 }
 
 /** El icono de un accesorio (sombrero, mochila): llega cuando se descarga su modelo. */

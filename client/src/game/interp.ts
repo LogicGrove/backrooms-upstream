@@ -104,7 +104,7 @@ export class Track<S extends Snap> {
     if (rt <= a.t) return copy(a), a;
     if (n) {
       // un salto de verdad (caída, reaparición): sin interpolar, se queda en el viejo hasta la mitad y salta
-      if (Math.hypot(n.x - a.x, n.z - a.z) > 4) return copy(rt - a.t < (n.t - a.t) / 2 ? a : n), a;
+      if (Math.hypot(n.x - a.x, n.z - a.z) > 4 || Math.abs(n.y - a.y) > 3) return copy(rt - a.t < (n.t - a.t) / 2 ? a : n), a;
       const u = Math.min(1, Math.max(0, (rt - a.t) / (n.t - a.t || 1)));
       out.x = a.x + (n.x - a.x) * u;
       out.y = a.y + (n.y - a.y) * u;

@@ -62,12 +62,20 @@ export default function RoomSettingsPanel({ room, me, sock }: { room: RoomView; 
           />
         ) : room.fixedSeed || 'RANDOM'}
       </Setting>
+      <Setting label="POOLROOMS">
+        {owner ? (
+          <button type="button" className="br-opt" onClick={() => set({ pools: !room.pools })}>
+            ◀ {room.pools ? 'ON' : 'OFF'} ▶
+          </button>
+        ) : room.pools ? 'ON' : 'OFF'}
+      </Setting>
       <Setting label="DIFFICULTY">
         {owner ? (
           <button type="button" className="br-opt" onClick={() => set({ difficulty: diffs[(diffs.indexOf(room.difficulty) + 1) % diffs.length] })}>
             ◀ {DIFF[room.difficulty]} ▶
           </button>
         ) : DIFF[room.difficulty]}
+        <small className="br-lobby__dim"> MONEY x{DIFFICULTY[room.difficulty].money} · LOOT {Math.round(DIFFICULTY[room.difficulty].loot * 100)}% · {DIFFICULTY[room.difficulty].ents} ENT</small>
       </Setting>
     </div>
   );

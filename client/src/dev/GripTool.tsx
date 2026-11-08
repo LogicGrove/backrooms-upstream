@@ -7,7 +7,8 @@ import { TransformControls } from 'three/examples/jsm/controls/TransformControls
 import { DEFAULT_LOOK } from '@backrooms/shared';
 import { Player } from '../game/player';
 import { aim } from '../game/rig';
-import { grips, DEFAULT_GRIPS, type Hand, type V3 } from '../game/grips';
+import { loadAnimations } from '../game/anim/animator';
+import { grips, DEFAULT_GRIPS, type GripId, type Hand, type V3 } from '../game/grips';
 import { Cosmetics, PIECES, DEFAULT_PIECES, BONE, type Piece } from '../game/cosmetics';
 import type { Controls } from '../game/input';
 import type { World } from '../game/world';
@@ -23,10 +24,11 @@ import type { Assets } from '../game/game';
  * «SAVE» escribe src/game/grips.json y src/game/pieces.json, que es lo que lee el juego. Ctrl+Z / Ctrl+Y deshacen y rehacen.
  */
 
-type Gear = 'flashlight' | 'camera' | 'gun';
-const GEARS: Gear[] = ['flashlight', 'camera', 'gun'];
+type Gear = GripId;
+const GEARS: Gear[] = ['flashlight', 'camera', 'gun', 'caution', 'radar', 'totem', 'watergun'];
+const GADGETS: Gear[] = ['caution', 'radar', 'totem']; // los de la barra rápida: Player.gadget, con la derecha
 // cómo apuntaba los dedos el IK viejo (en el espacio de la vista), para «FROM OLD»
-const OLD: Record<Gear, Partial<Record<'left' | 'right', V3>>> = {
+const OLD: Partial<Record<Gear, Partial<Record<'left' | 'right', V3>>>> = {
   flashlight: { left: [0.5, -0.15, -0.85] },
   camera: { right: [-0.1, 0, -1], left: [0.85, 0.25, -0.45] },
   gun: { right: [-0.55, -0.45, -0.7], left: [0.7, 0.35, -0.6] },
@@ -96,6 +98,7 @@ export default function GripTool() {
   const [aimOn, setAimOn] = useState(false);
   const [first, setFirst] = useState(false);
   const [help, setHelp] = useState(false);
+  const [keep, setKeep] = useState(true); // al mover el objeto, las manos se quedan donde están
   const [, tick] = useState(0);
   const [msg, setMsg] = useState('');
   const api = useRef({ legacy: () => {}, view: (_v: View) => {}, frame: () => {}, bump: () => {} });
@@ -180,7 +183,7 @@ export default function GripTool() {
     ro.observe(box.current!);
 
     const loader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
-    const names = ['hazmat', 'flashlight', 'camcorder', 'gun'] as const;
+    const names = ['hazmat', 'flashlight', 'camcorder', 'gun', 'duct', 'radar', 'totem'] as const;
     let player: Player | undefined, cos: Cosmetics | undefined, last = performance.now();
     const bodyQ = new THREE.Quaternion(), bone = new THREE.Vector3(), off = new THREE.Vector3(), delta = new THREE.Vector3();
     /** Dónde está ahora la pieza: el hueso más su desplazamiento en el marco del cuerpo (lo mismo que hace Cosmetics.update). */
@@ -226,9 +229,9 @@ export default function GripTool() {
     };
     api.current.bump = () => (commit('drag'), tick((n) => n + 1));
 
-    Promise.all(names.map((n) => loader.loadAsync(`/models/backrooms/${n}.glb`))).then((gl) => {
+    Promise.all([...names.map((n) => loader.loadAsync(`/models/backrooms/${n}.glb`)), loadAnimations().catch(() => undefined)]).then((gl) => {
       if (!alive) return;
-      const gltf = Object.fromEntries(names.map((n, i) => [n, gl[i]]));
+      const gltf = Object.fromEntries(names.map((n, i) => [n, gl[i]])); // (el último de gl es el paquete de animaciones: hace falta antes de crear el Player)
       const world = { root: new THREE.Group(), solid: () => false, furniture: () => false, voidAt: () => false } as unknown as World;
       scene.add(world.root);
       player = new Player(world, { gltf } as unknown as Assets, eyeCam, new THREE.SpotLight(), true);
@@ -252,7 +255,7 @@ export default function GripTool() {
         } else {
           p.update(0, ctrl(live.current.aimOn));
           const mid = p.rig.bone(side_.current === 'left' ? 'LeftHandMiddle1' : 'RightHandMiddle1');
-          aim(hand, mid!, new THREE.Vector3(...OLD[g][side_.current]!).applyQuaternion(eyeCam.quaternion).normalize());
+          aim(hand, mid!, new THREE.Vector3(...OLD[g]![side_.current]!).applyQuaternion(eyeCam.quaternion).normalize());
           want = hand.getWorldQuaternion(new THREE.Quaternion());
         }
         const rel = qi.invert().multiply(want), e = new THREE.Euler().setFromQuaternion(rel, 'XYZ');
@@ -271,8 +274,9 @@ export default function GripTool() {
       if (player && cos) {
         const gear = isGear(s);
         player.left = gear ? 'flashlight' : 'none';
-        player.hold(gear && s !== 'flashlight' ? s : 'none');
-        player.update(dt, ctrl(a && s === 'camera'));
+        player.hold(s === 'camera' || s === 'gun' || s === 'watergun' ? s : 'none');
+        player.gadget = GADGETS.includes(s as Gear) ? (s as 'caution') : 'none';
+        player.update(dt, ctrl(a && (s === 'camera' || s === 'gun' || s === 'watergun')));
         // en primera persona el jugador encoge su cabeza; para colocar un sombrero hay que verla
         if (!gear) for (const n of ['Head', 'Neck']) player.rig.bone(n)?.scale.setScalar(1);
         const piece = gear ? undefined : PIECES[s];
@@ -307,6 +311,22 @@ export default function GripTool() {
   const hand = grips[gear][side] ? side : side === 'left' ? 'right' : 'left';
   const setV3 = (key: string, a: V3, i: number, n: number) => edit(key, () => (a[i] = n));
   const view = grips[gear].view;
+  // mueve el objeto (su pos/rot en la vista); con `keep` las manos no se mueven: su agarre, que va en el espacio del objeto, se reexpresa en el nuevo
+  const setView = (key: string, a: V3, i: number, n: number, moves = true) =>
+    edit(key, () => {
+      const mat = () => new THREE.Matrix4().compose(new THREE.Vector3(...view.pos), new THREE.Quaternion().setFromEuler(new THREE.Euler(view.rot[0] * D, view.rot[1] * D, view.rot[2] * D)), new THREE.Vector3(1, 1, 1));
+      const m0 = mat();
+      a[i] = n;
+      if (!keep || !moves) return;
+      const to = mat().invert().multiply(m0), qt = new THREE.Quaternion().setFromRotationMatrix(to);
+      for (const hd of [grips[gear].left, grips[gear].right]) {
+        if (!hd) continue;
+        const p = new THREE.Vector3(...hd.pos).applyMatrix4(to);
+        hd.pos = [+p.x.toFixed(4), +p.y.toFixed(4), +p.z.toFixed(4)];
+        const e = new THREE.Euler().setFromQuaternion(qt.clone().multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(hd.rot[0] * D, hd.rot[1] * D, hd.rot[2] * D))), 'XYZ');
+        hd.rot = [+(e.x / D).toFixed(1), +(e.y / D).toFixed(1), +(e.z / D).toFixed(1)];
+      }
+    });
 
   const select = (id: string) => {
     setSel(id);
@@ -466,9 +486,9 @@ export default function GripTool() {
                   mirror → {hand === 'left' ? 'right' : 'left'}
                 </button>
               )}
-              {gear === 'camera' && (
+              {(gear === 'camera' || gear === 'gun' || gear === 'watergun') && (
                 <button type="button" data-on={aimOn || undefined} onClick={() => (setAimOn(!aimOn), setFirst(true))}>
-                  looking through
+                  aiming (right click)
                 </button>
               )}
             </div>
@@ -496,13 +516,16 @@ export default function GripTool() {
             <h3>{aimOn ? 'at the eye (view space, m)' : 'item in view (view space, m)'}</h3>
             {(['x', 'y', 'z'] as const).map((k, i) => {
               const a = aimOn && view.aim ? view.aim : view.pos;
-              return <Num key={k} label={k} v={a[i]} min={-0.6} max={0.3} step={0.001} on={(n) => setV3(`${gear}view${aimOn}${i}`, a, i, n)} />;
+              return <Num key={k} label={k} v={a[i]} min={-0.6} max={0.3} step={0.001} on={(n) => setView(`${gear}view${aimOn}${i}`, a, i, n, !aimOn)} />;
             })}
+            <label style={{ display: 'block', margin: '4px 0' }}>
+              <input type="checkbox" checked={keep} onChange={(e) => setKeep(e.target.checked)} /> hands stay put when moving the item
+            </label>
             {!aimOn && (
               <>
                 <h3>item rotation (deg)</h3>
                 {(['x', 'y', 'z'] as const).map((k, i) => (
-                  <Num key={k} label={k} v={view.rot[i]} min={-180} max={180} step={1} on={(n) => setV3(`${gear}viewrot${i}`, view.rot, i, n)} />
+                  <Num key={k} label={k} v={view.rot[i]} min={-180} max={180} step={1} on={(n) => setView(`${gear}viewrot${i}`, view.rot, i, n)} />
                 ))}
               </>
             )}
@@ -513,7 +536,7 @@ export default function GripTool() {
           <button type="button" data-hot={anyDirty || undefined} onClick={() => void save()} title="Ctrl+S">
             SAVE
           </button>
-          {isGear(sel) && sel !== 'flashlight' && (
+          {(sel === 'camera' || sel === 'gun') && (
             <button type="button" onClick={() => (api.current.legacy(), bump(), setMsg('hand orientation taken from the old IK'))}>
               FROM OLD
             </button>
@@ -536,7 +559,7 @@ export default function GripTool() {
 }
 
 function ctrl(aim: boolean): Controls {
-  return { move: new THREE.Vector2(), look: new THREE.Vector2(), run: false, jump: false, flash: false, grab: false, bag: false, aim, zoom: 0, fire: false, reload: false, swap: false, pause: false };
+  return { move: new THREE.Vector2(), look: new THREE.Vector2(), run: false, jump: false, flash: false, grab: false, bag: false, aim, zoom: 0, fire: false, reload: false, swap: false, slot: -1, wheel: 0, use: false, pause: false };
 }
 
 const CSS = `

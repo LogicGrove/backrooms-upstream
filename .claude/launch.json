@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "client-dev-5190",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "client", "--port", "5190", "--strictPort"],
+      "port": 5190
+    }
+  ]
+}

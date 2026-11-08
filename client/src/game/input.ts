@@ -21,11 +21,25 @@ export interface Controls {
   fire: boolean;
   reload: boolean;
   swap: boolean;
+  /** Y: soltar una unidad del objeto elegido de la barra. */
+  drop?: boolean;
+  /** Barra de acceso rápido: la ranura (0–3) cuya tecla se ha pulsado este fotograma (-1 ninguna), los pasos de rueda y X (usar la elegida). */
+  slot: number;
+  wheel: number;
+  use: boolean;
   pause: boolean;
   /** Space mantenido (contener la respiración en un escondite). */
   hold?: boolean;
+  /** C o Ctrl izquierdo mantenido: agacharse (solo lo usa el nivel «Run for your life»; allí Shift/RUN también agacha). */
+  crouch?: boolean;
+  /** Clic izquierdo y G mantenidos (el chorro de la pistola de agua y la recarga). */
+  fireHeld?: boolean;
+  grabHeld?: boolean;
+  /** La ranura (0–3) cuya tecla sigue pulsada (-1 ninguna) y X mantenida: beber una lata pide mantener. */
+  slotHeld?: number;
+  useHeld?: boolean;
 }
-export type Pulse = 'jump' | 'flash' | 'grab' | 'bag' | 'fire' | 'reload' | 'swap' | 'pause';
+export type Pulse = 'jump' | 'flash' | 'grab' | 'bag' | 'fire' | 'reload' | 'swap' | 'use' | 'pause' | 'drop';
 
 const MOUSE = 0.0022; // radianes por píxel de ratón
 const TOUCH = 0.006; // por píxel de dedo
@@ -41,15 +55,38 @@ export class Input {
   private holds = new Set<'run' | 'aim'>();
   private zoomV = 0;
   private toggled = false;
+  private fireDown = false;
   private offs: (() => void)[] = [];
   private wasLocked = false;
   private lockedAt = 0; // cuándo se capturó el puntero (los primeros ms traen un salto falso)
-  private softUntil = 0; // hasta cuándo un fallo al capturar el puntero no pausa (reanudar con Esc: el navegador exige un clic)
+  // reanudar con Esc: el navegador no lo cuenta como gesto y no deja recapturar el puntero. Mientras dure `soft` un fallo al
+  // capturarlo no pausa (pausar ahí era el bucle: Esc reanuda, falla el puntero, pausa otra vez): se pide un clic (`needClick`)
+  private soft_ = false;
+  private guardUntil = 0; // justo tras reanudar no se admite ninguna pausa (repetición de Esc, pointerlockchange tardío)
+  private checkAt = 0; // si pasado esto sigue sin puntero, hace falta un clic
+  /** Se juega sin el puntero capturado: el primer clic lo captura (HUD: "click to continue"). */
+  needClick = false;
+  private wheelV = 0;
+  private slotV = -1;
   private asked = -1e9; // cuándo se pidió el puntero por última vez (pedirlo dos veces seguidas da error)
   /** Si hay que leer (en pausa o en el menú no: nada se acumula). */
   active = false;
   /** Con el inventario abierto el puntero va suelto: soltarlo no pausa y un clic no lo vuelve a bloquear. */
-  suspend = false;
+  private suspend_ = false;
+  /** Quien más suelta el puntero (la consola de admin) lo hace con su propia llave: lo que haga el juego con `suspend` no la pisa ni la deja colgada. */
+  private ext = new Set<string>();
+  get suspend() {
+    return this.suspend_ || this.ext.size > 0;
+  }
+  set suspend(v: boolean) {
+    this.suspend_ = v;
+  }
+  block(key: string) {
+    this.ext.add(key);
+  }
+  unblock(key: string) {
+    this.ext.delete(key);
+  }
 
   constructor(readonly el: HTMLElement) {
     const on = <K extends keyof WindowEventMap>(t: K, f: (e: WindowEventMap[K]) => void, o?: AddEventListenerOptions) => {
@@ -60,11 +97,14 @@ export class Input {
       document.addEventListener(t, f as EventListener);
       this.offs.push(() => document.removeEventListener(t, f as EventListener));
     };
-    const KEYS: Record<string, Pulse> = { Space: 'jump', KeyF: 'flash', KeyG: 'grab', KeyE: 'bag', KeyR: 'reload', KeyQ: 'swap' };
+    const KEYS: Record<string, Pulse> = { Space: 'jump', KeyF: 'flash', KeyG: 'grab', KeyE: 'bag', KeyR: 'reload', KeyQ: 'swap', KeyX: 'use', KeyY: 'drop' };
     on('keydown', (e) => {
       if (!this.active || (e.target as HTMLElement | null)?.tagName === 'INPUT') return; // escribiendo (el chat): no es para el juego
+      if (e.repeat) return; // (la repetición de Esc tras reanudar volvía a pausar)
+      // tras reanudar con Esc el navegador no da el puntero hasta un gesto: cualquier otra tecla lo es
+      if (this.needClick && e.code !== 'Escape' && !this.suspend) this.lock(true);
       if (e.code === 'Escape') return this.pulses.add(this.suspend ? 'bag' : 'pause'); // con el inventario abierto, lo cierra
-      if (e.repeat) return;
+      if (/^Digit[1-4]$/.test(e.code)) this.slotV = +e.code.slice(5) - 1;
       this.keys.add(e.code);
       // contener la respiración alternando (ajuste): Space la pone y la quita; entrar o salir de un escondite (E) la suelta
       if (e.code === 'Space') this.toggled = settings.toggleBreath && !this.toggled;
@@ -85,31 +125,35 @@ export class Input {
       if (!this.active) return;
       if (e.button === 2 && this.locked) return void this.holds.add('aim');
       if (e.button !== 0) return;
-      if (this.locked) this.pulses.add('fire');
-      else if (!this.suspend && matchMedia('(pointer: fine)').matches) this.lock();
+      if (this.locked) (this.pulses.add('fire'), (this.fireDown = true));
+      else if (!this.suspend && matchMedia('(pointer: fine)').matches) this.soft_ = true, this.lock(true);
     });
-    on('mouseup', (e) => e.button === 2 && this.holds.delete('aim'));
+    // al volver a la ventana (Alt+Tab) no hay puntero y el navegador no lo da sin un gesto: se pide un clic en vez de quedarse en un limbo
+    on('focus', () => {
+      if (this.active && !this.suspend && !this.locked && matchMedia('(pointer: fine)').matches) (this.soft_ = true), (this.needClick = true);
+    });
+    on('mouseup', (e) => (e.button === 2 ? this.holds.delete('aim') : e.button === 0 && (this.fireDown = false)));
     // el clic derecho es de la cámara, no del menú del navegador
     on('contextmenu', (e) => this.active && e.preventDefault());
-    // la rueda: cambia de objeto o, mirando por la cámara, el zoom
+    // la rueda: cambia de ranura de la barra o, mirando por la cámara, el zoom
     on(
       'wheel',
       (e) => {
         if (!this.active || !this.locked || Math.abs(e.deltaY) <= 4) return;
         if (this.holds.has('aim')) this.zoomV -= Math.sign(e.deltaY);
-        else this.pulses.add('swap');
+        else this.wheelV += Math.sign(e.deltaY);
       },
       { passive: true },
     );
     // lo que se lleva el puntero o la pestaña: pausa
     doc('pointerlockchange', () => {
       this.asked = -1e9;
-      if (this.locked) this.lockedAt = performance.now();
+      if (this.locked) (this.lockedAt = performance.now()), (this.needClick = this.soft_ = false);
       if (this.wasLocked && !this.locked && this.active && !this.suspend) this.pulses.add('pause');
       this.wasLocked = this.locked;
     });
     // el navegador no da el puntero (pedido muy pronto tras soltarlo, o sin un clic): sin ratón no se juega
-    doc('pointerlockerror', () => ((this.asked = -1e9), this.active && performance.now() >= this.softUntil && this.pulses.add('pause')));
+    doc('pointerlockerror', () => ((this.asked = -1e9), this.fail()));
     // salir de pantalla completa (Escape con el inventario abierto, el gesto de atrás en el móvil): pausa
     doc('fullscreenchange', () => !document.fullscreenElement && this.active && this.pulses.add('pause'));
     on('blur', () => this.active && this.pulses.add('pause'));
@@ -126,23 +170,42 @@ export class Input {
   }
 
   /** Bloquear el puntero (solo con ratón; en táctil no hace falta). */
-  lock() {
-    if (!matchMedia('(pointer: fine)').matches || this.locked || performance.now() - this.asked < 1000) return;
+  lock(gesture = false) {
+    // (un clic o una tecla del usuario salta la espera: si el navegador se tragó el pedido anterior sin avisar, no se quedaba sin puntero)
+    if (!matchMedia('(pointer: fine)').matches || this.locked || (!gesture && performance.now() - this.asked < 1000)) return;
     this.asked = performance.now();
     try {
-      const r = this.el.requestPointerLock() as unknown as Promise<void> | undefined;
-      r?.catch?.(() => this.active && performance.now() >= this.softUntil && this.pulses.add('pause'));
+      // movimiento crudo (sin aceleración del sistema: en Opera/Chrome con ratones de alta frecuencia el giro iba a saltos);
+      // si el navegador no admite la opción (Firefox) o la rechaza, se pide normal
+      const raw = () => this.el.requestPointerLock({ unadjustedMovement: true } as PointerLockOptions) as unknown as Promise<void> | undefined;
+      const plain = () => this.el.requestPointerLock() as unknown as Promise<void> | undefined;
+      const r = raw();
+      r?.catch?.(() => {
+        try {
+          plain()?.catch?.(() => this.fail());
+        } catch {
+          this.fail();
+        }
+      });
     } catch {
-      if (this.active && performance.now() >= this.softUntil) this.pulses.add('pause');
+      this.fail();
     }
   }
 
-  /**
-   * Reanudar con Esc: el navegador no cuenta Esc como un gesto y no deja recapturar el puntero, así que ese fallo no
-   * debe volver a pausar; se sigue jugando y el primer clic lo captura (ver mousedown).
-   */
+  /** El navegador no da el puntero: tras reanudar con Esc se pide un clic; si no, sin ratón no se juega (pausa). */
+  private fail() {
+    if (!this.active) return;
+    // nunca pausa por esto: cerrar el ordenador, el inventario o el chat con Esc (que no es un gesto) pedía el puntero y, al
+    // fallar, pausaba el juego. Ahora se sigue jugando y el primer clic o tecla lo captura (CLICK TO CONTINUE)
+    this.soft_ = true;
+    this.needClick = true;
+  }
+
+  /** Reanudar con Esc (llamar antes de reanudar): se sigue jugando aunque no haya puntero y el primer clic lo captura (ver mousedown). */
   soft() {
-    this.softUntil = performance.now() + 2000;
+    this.soft_ = true;
+    this.guardUntil = performance.now() + 500;
+    this.checkAt = performance.now() + 700;
   }
 
   unlock() {
@@ -192,8 +255,17 @@ export class Input {
       fire: p.has('fire'),
       reload: p.has('reload'),
       swap: p.has('swap'),
-      pause: p.has('pause'),
+      drop: p.has('drop'),
+      slot: this.slotV,
+      wheel: this.wheelV,
+      use: p.has('use'),
+      pause: p.has('pause') && performance.now() >= this.guardUntil,
       hold: settings.toggleBreath ? this.toggled : k.has('Space'),
+      crouch: k.has('KeyC') || k.has('ControlLeft'),
+      fireHeld: this.fireDown,
+      grabHeld: k.has('KeyG'),
+      slotHeld: [0, 1, 2, 3].find((i) => k.has('Digit' + (i + 1))) ?? -1,
+      useHeld: k.has('KeyX'),
     };
     // el giro de un fotograma tiene tope: tras un parón de la página (red lenta, GC) el ratón acumulado no se aplica de
     // golpe, sino repartido en los fotogramas siguientes; lo que pase de 1 rad se descarta (era un salto falso)
@@ -202,6 +274,16 @@ export class Input {
     this.look.sub(c.look);
     if (Math.abs(this.look.x) > LOOK_DROP || Math.abs(this.look.y) > LOOK_DROP) this.look.set(0, 0);
     this.zoomV = 0;
+    this.wheelV = 0;
+    this.slotV = -1;
+    // vigilante: se juega (sin pausa, inventario ni chat) y no hay puntero, y nadie lo está pidiendo: hace falta un clic.
+    // Cubre los casos raros (Alt+Tab, Esc repetido, un pedido perdido) que ningún otro camino atrapaba
+    if (this.active && !this.suspend && !this.locked && !this.needClick && performance.now() - this.asked > 1200 && performance.now() >= this.guardUntil && matchMedia('(pointer: fine)').matches) (this.soft_ = true), (this.needClick = true);
+    // reanudado con Esc y 0,7 s después sigue sin puntero: hace falta un clic
+    if (this.checkAt && performance.now() >= this.checkAt) {
+      this.checkAt = 0;
+      if (this.soft_ && !this.locked && !this.suspend && matchMedia('(pointer: fine)').matches) this.needClick = true;
+    }
     p.clear();
     return c;
   }
@@ -212,6 +294,10 @@ export class Input {
     this.toggled = false;
     this.holds.clear();
     this.pulses.clear();
+    this.needClick = this.soft_ = false;
+    this.checkAt = 0;
+    this.wheelV = 0;
+    this.slotV = -1;
     this.look.set(0, 0);
     this.stickV.set(0, 0);
   }

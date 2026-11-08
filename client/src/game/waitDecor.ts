@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-import { WAIT_HALF } from '@backrooms/shared';
+import type { GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
+import { LEVELS, WAIT_HALF } from '@backrooms/shared';
+import { fit } from './hospital';
 import { Dust, MONO, bagTex, clamp, decal, hash, softTex, type Bag, type Box } from './waitKit';
 
 /*
@@ -12,6 +14,54 @@ import { Dust, MONO, bagTex, clamp, decal, hash, softTex, type Bag, type Box } f
  */
 
 const H = WAIT_HALF;
+const BW = 768, BH = 508;
+
+/** La pizarra: el número de ronda y el nivel al que lleva la puerta (nombre, título y una línea de ambiente), a tiza. La misión se vota al cruzar la puerta. */
+function paintBoard(x: CanvasRenderingContext2D, round: number, levelId: string) {
+  const lv = LEVELS[levelId] ?? LEVELS.level0;
+  x.fillStyle = '#d4d3c6';
+  x.fillRect(0, 0, BW, BH);
+  for (let n = 0; n < 700; n++) {
+    x.fillStyle = `rgba(80,76,60,${hash(n) * 0.12})`;
+    x.fillRect(hash(n * 3) * BW, hash(n * 5) * BH, 2 + hash(n) * 30, 2 + hash(n + 1) * 4);
+  }
+  x.lineCap = 'round';
+  x.textBaseline = 'alphabetic';
+  x.textAlign = 'left';
+  x.fillStyle = x.strokeStyle = '#1c3a6b';
+  x.lineWidth = 4;
+  x.font = `bold 30px ${MONO}`;
+  x.fillText(`ROUND ${round}`, 36, 62);
+  x.fillStyle = '#8a1f1a';
+  x.font = `bold 22px ${MONO}`;
+  x.textAlign = 'right';
+  x.fillText("DON'T LOOK UP", BW - 36, 60);
+  x.fillStyle = x.strokeStyle = '#1c3a6b';
+  x.textAlign = 'left';
+  x.font = `bold 20px ${MONO}`;
+  x.fillText('TODAY THE DOOR GOES TO', 36, 150);
+  x.font = `bold 108px ${MONO}`;
+  x.fillText(lv.name, 36, 262);
+  x.lineWidth = 5;
+  x.beginPath();
+  x.moveTo(40, 284);
+  x.lineTo(40 + x.measureText(lv.name).width * 0.98, 281);
+  x.stroke();
+  x.fillStyle = '#8a1f1a';
+  x.font = `bold 40px ${MONO}`;
+  x.fillText(lv.title, 36, 340);
+  x.fillStyle = '#1c3a6b';
+  x.font = `bold 21px ${MONO}`;
+  const words = lv.blurb.split(' ');
+  let line = '', y = 392;
+  for (const w of words) {
+    if ((line + w).length > 42) (x.fillText(line.trim(), 36, y), (y += 28), (line = ''));
+    line += w + ' ';
+  }
+  x.fillText(line.trim(), 36, y);
+  x.font = `bold 18px ${MONO}`;
+  x.fillText('MISSION IS VOTED AT THE DOOR', 36, BH - 28);
+}
 const HEIGHT = 2.6;
 export const TUBE_Z = [-0.7, 1.25] as const;
 
@@ -23,6 +73,7 @@ export class Decor {
   readonly vendAt = new THREE.Vector3(2.2, 1.1, -1.15);
   readonly lampAt = new THREE.Vector3(2.62, 1.3, -2.12);
   lampOn = true;
+  private board!: THREE.CanvasTexture;
   private lampLight = new THREE.PointLight(0xfff0c8, 3.2, 6, 1.4);
   private lampMat = new THREE.MeshBasicMaterial({ color: 0xfff3cf, toneMapped: false });
   private lampHalo: THREE.Sprite;
@@ -34,12 +85,12 @@ export class Decor {
   private beams: THREE.MeshBasicMaterial[] = [];
   private dustA: Dust;
   private dustB: Dust;
-  private can: THREE.Mesh;
+  private can: THREE.Object3D;
   private canAt = -1e9;
   private blob: THREE.MeshBasicMaterial;
   private lampBlend = 1;
 
-  constructor(readonly scene: THREE.Scene, private bag: Bag, private reduced: boolean) {
+  constructor(readonly scene: THREE.Scene, private bag: Bag, private reduced: boolean, vend?: GLTF, canGlb?: GLTF, wbGlb?: GLTF) {
     const S = scene;
     const std = (color: number, rough = 0.8, metal = 0) => {
       const x = new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: metal });
@@ -262,136 +313,92 @@ export class Decor {
     add(decal(0.2, 0.15, paper(note), [-H.x + 0.012, 1.3, -2.15], 0, Math.PI / 2));
 
     // la pizarra: marco, bandeja y garabatos
-    const board = bagTex(bag, 512, 340, (x) => {
-      x.fillStyle = '#d4d3c6';
-      x.fillRect(0, 0, 512, 340);
-      for (let n = 0; n < 500; n++) {
-        x.fillStyle = `rgba(80,76,60,${hash(n) * 0.12})`;
-        x.fillRect(hash(n * 3) * 512, hash(n * 5) * 340, 2 + hash(n) * 22, 2 + hash(n + 1) * 3);
-      }
-      x.lineCap = 'round';
-      x.strokeStyle = '#1c3a6b';
-      x.lineWidth = 3;
-      x.font = `bold 34px ${MONO}`;
-      x.fillStyle = '#1c3a6b';
-      x.fillText('DAY 14', 24, 56);
-      for (let g = 0; g < 3; g++) for (let i = 0; i < 4; i++) (x.beginPath(), x.moveTo(30 + g * 56 + i * 9, 80), x.lineTo(30 + g * 56 + i * 9, 120), x.stroke());
-      for (let g = 0; g < 3; g++) (x.beginPath(), x.moveTo(24 + g * 56, 112), x.lineTo(70 + g * 56, 88), x.stroke());
-      x.strokeStyle = '#8a1f1a';
-      x.fillStyle = '#8a1f1a';
-      x.font = `bold 26px ${MONO}`;
-      x.fillText('DON\'T LOOK UP', 230, 60);
-      x.fillText('STILL NO WAY OUT', 30, 190);
-      x.lineWidth = 4;
-      (x.beginPath(), x.moveTo(30, 200), x.lineTo(330, 200), x.stroke());
-      // un mapa a medias y una flecha a «???»
-      x.strokeStyle = '#1c3a6b';
-      x.lineWidth = 3;
-      x.strokeRect(300, 100, 80, 50);
-      x.strokeRect(380, 125, 60, 70);
-      x.beginPath();
-      x.moveTo(420, 130);
-      x.lineTo(470, 80);
-      x.lineTo(455, 80);
-      x.moveTo(470, 80);
-      x.lineTo(470, 95);
-      x.stroke();
-      x.fillStyle = '#1c3a6b';
-      x.font = `bold 30px ${MONO}`;
-      x.fillText('???', 430, 70);
-      // un monigote y la puerta
-      x.lineWidth = 3;
-      x.beginPath();
-      x.arc(70, 262, 14, 0, 7);
-      for (const [a, b, c, d] of [[70, 276, 70, 312], [70, 286, 48, 300], [70, 286, 92, 300], [70, 312, 54, 336], [70, 312, 86, 336]]) (x.moveTo(a, b), x.lineTo(c, d));
-      x.stroke();
-      x.strokeRect(300, 250, 50, 80);
-      x.font = `bold 20px ${MONO}`;
-      x.fillText('IT WAS OPEN', 150, 292);
-    });
+    const board = bagTex(bag, BW, BH, (x) => paintBoard(x, 1, 'level0'));
+    this.board = board;
     const bm = basic(board, { color: 0xdcd6c0 });
-    const bz = H.z - 0.02;
-    add(decal(1.3, 0.86, bm, [-1.1, 1.5, bz - 0.01], 0, Math.PI));
-    const frameB = std(0x8c887a, 0.5, 0.5);
-    const tray = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.03, 0.07), frameB);
-    tray.position.set(-1.1, 1.06, bz - 0.04);
-    add(tray);
-    for (const [w, h, x, y] of [[1.36, 0.03, 0, 0.44], [1.36, 0.03, 0, -0.44], [0.03, 0.9, -0.67, 0], [0.03, 0.9, 0.67, 0]] as const) {
-      const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.03), frameB);
-      f.position.set(-1.1 + x, 1.5 + y, bz);
-      add(f);
+    let bz = H.z - 0.02;
+    if (wbGlb) {
+      // el modelo de la pizarra (3 × 1,76 × 0,12 m, girado 162° en el archivo): se endereza, se escala a 1,9 m de ancho y se apoya en la pared; el lienzo va delante, en su zona útil
+      const m = wbGlb.scene.clone(true);
+      m.rotation.y = 2.8274;
+      m.updateMatrixWorld(true);
+      const b0 = new THREE.Box3().setFromObject(m), k = 1.9 / (b0.max.x - b0.min.x);
+      m.scale.setScalar(k);
+      m.updateMatrixWorld(true);
+      const b = new THREE.Box3().setFromObject(m), c = b.getCenter(new THREE.Vector3());
+      m.position.set(-1.1 - c.x, 1.5 - c.y, H.z - 0.005 - b.max.z);
+      m.traverse((o) => {
+        const mesh = o as THREE.Mesh, mat = mesh.material as THREE.MeshStandardMaterial | undefined;
+        if (!mesh.isMesh || !mat?.isMeshStandardMaterial) return;
+        const own = (mesh.material = mat.clone());
+        own.roughness = 0.9;
+        own.metalness = 0;
+        if (own.map) (own.emissiveMap = own.map), own.emissive.setScalar(0.3);
+        bag.own.push(own);
+      });
+      add(m);
+      bz = H.z - 0.005 - (b.max.z - b.min.z) + 0.004; // la cara de delante
+      add(decal(1.56, 1.03, bm, [-1.1, 1.5, bz - 0.006], 0, Math.PI));
+    } else {
+      add(decal(1.3, 0.86, bm, [-1.1, 1.5, bz - 0.01], 0, Math.PI));
+      const frameB = std(0x8c887a, 0.5, 0.5);
+      const tray = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.03, 0.07), frameB);
+      tray.position.set(-1.1, 1.06, bz - 0.04);
+      add(tray);
+      for (const [w, h, x, y] of [[1.36, 0.03, 0, 0.44], [1.36, 0.03, 0, -0.44], [0.03, 0.9, -0.67, 0], [0.03, 0.9, 0.67, 0]] as const) {
+        const f = new THREE.Mesh(new THREE.BoxGeometry(w, h, 0.03), frameB);
+        f.position.set(-1.1 + x, 1.5 + y, bz);
+        add(f);
+      }
     }
 
     // ── la máquina expendedora ───────────────────────────────────────────────
-    const vx = H.x - 0.4, vz = -1.15, fx = vx - 0.4; // el frente a x = 2,2
-    const vendTex = bagTex(bag, 256, 512, (x) => {
-      x.fillStyle = '#1a1d1c';
-      x.fillRect(0, 0, 256, 512);
-      x.fillStyle = '#b21d1d';
-      x.fillRect(0, 0, 256, 46);
-      x.fillStyle = '#efe9d2';
-      x.font = `bold 26px ${MONO}`;
-      x.textAlign = 'center';
-      x.fillText('COLD DRINKS', 128, 33);
-      // el expositor, iluminado
-      x.fillStyle = '#c9d6cc';
-      x.fillRect(14, 58, 170, 300);
-      const cols = ['#b21d1d', '#2f6f91', '#d8b13a', '#3c8a4a', '#b21d1d'];
-      for (let r = 0; r < 5; r++)
-        for (let c = 0; c < 5; c++) {
-          if (hash(r * 5 + c + 3) < 0.15) continue; // un hueco: se vendió
-          x.fillStyle = cols[(r * 2 + c) % cols.length];
-          x.fillRect(22 + c * 32, 70 + r * 58, 22, 40);
-          x.fillStyle = 'rgba(255,255,255,0.5)';
-          x.fillRect(24 + c * 32, 72 + r * 58, 4, 36);
-        }
-      // el teclado, el precio y la ranura
-      x.fillStyle = '#34312a';
-      x.fillRect(192, 66, 50, 180);
-      x.fillStyle = '#d8d2b8';
-      x.font = `bold 14px ${MONO}`;
-      for (let i = 0; i < 6; i++) (x.fillRect(198, 76 + i * 26, 38, 18), (x.fillStyle = '#26221a'), x.fillText(String(i + 1), 217, 90 + i * 26), (x.fillStyle = '#d8d2b8'));
-      x.fillStyle = '#7a1212';
-      x.fillRect(192, 258, 50, 20);
-      x.fillStyle = '#ff5a3a';
-      x.font = `bold 15px ${MONO}`;
-      x.fillText('0.75', 217, 274);
-      x.fillStyle = '#0c0c0b';
-      x.fillRect(30, 400, 150, 70);
-      x.fillStyle = '#4b4a42';
-      x.fillRect(22, 392, 166, 8);
-      x.fillStyle = '#efe9d2';
-      x.font = `bold 13px ${MONO}`;
-      x.fillText('PUSH', 105, 440);
-    });
-    const body = std(0x3a2a26, 0.6, 0.3);
-    add(box(0.8, 1.85, 0.92, body, vx, 0.925, vz));
-    this.vendMat.map = vendTex;
-    const front = decal(0.86, 1.72, this.vendMat, [fx - 0.004, 0.97, vz], 0, -Math.PI / 2);
-    front.renderOrder = 0;
-    add(front);
-    bag.own.push(this.vendMat);
+    const vz = -1.15;
+    let fx = H.x - 0.8, depth = 0.8; // el frente de la máquina (x) y su fondo; con el modelo, lo que midan
+    if (vend) {
+      const m = vend.scene;
+      m.rotation.y = -Math.PI / 2; // el frente del modelo mira a +z; aquí, a -x (hacia la sala)
+      m.updateMatrixWorld(true);
+      const b0 = new THREE.Box3().setFromObject(m), k = 1.85 / (b0.max.y - b0.min.y);
+      m.scale.setScalar(k);
+      m.updateMatrixWorld(true);
+      const b = new THREE.Box3().setFromObject(m), c = b.getCenter(new THREE.Vector3());
+      depth = b.max.x - b.min.x;
+      fx = H.x - depth;
+      m.position.set(fx - b.min.x, -b.min.y, vz - c.z);
+      add(m);
+    } else add(box(0.8, 1.85, 0.92, std(0x3a2a26, 0.6, 0.3), H.x - 0.4, 0.925, vz));
+    this.vendAt.x = fx;
     // el brillo en el suelo y la luz
     this.vendGlow = new THREE.MeshBasicMaterial({ map: softTex(bag, 0.8, 0.35), color: 0xaee8cf, transparent: true, opacity: 0.5, depthWrite: false, blending: THREE.AdditiveBlending });
-    bag.own.push(this.vendGlow);
+    bag.own.push(this.vendGlow, this.vendMat);
     add(decal(2.0, 2.4, this.vendGlow, [fx - 0.7, 0.011, vz], -Math.PI / 2, 0));
     this.vendLight.position.set(fx - 0.35, 1.3, vz);
     add(this.vendLight);
-    // la bandeja y la lata
-    const trayM = std(0x14120e, 0.7, 0.3);
-    add(box(0.16, 0.03, 0.46, trayM, fx - 0.05, 0.4, vz));
-    this.can = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.033, 0.033, 0.12, 14).rotateX(Math.PI / 2),
-      basic(bagTex(bag, 64, 32, (x) => {
-        x.fillStyle = '#b21d1d';
-        x.fillRect(0, 0, 64, 32);
-        x.fillStyle = '#efe9d2';
-        x.fillRect(0, 12, 64, 8);
-      })),
-    );
+    const trayM = std(0x14120e, 0.7, 0.3); // (la papelera lo usa)
+    // la lata de Almond Water cae al suelo, delante
+    this.can = new THREE.Group();
+    if (canGlb) {
+      // el mismo modelo y los mismos retoques que la lata del mapa (items.ts): mate y casi sin brillo propio; tumbada, de lado
+      const m = fit(canGlb, 0.17, 'y');
+      m.traverse((o) => {
+        const mesh = o as THREE.Mesh, mat = mesh.material as THREE.MeshStandardMaterial | undefined;
+        if (!mesh.isMesh || !mat?.isMeshStandardMaterial) return;
+        const own = (mesh.material = mat.clone());
+        own.color.multiplyScalar(0.7), (own.roughness = 1), (own.metalness = 0);
+        if (own.map) (own.emissiveMap = own.map), own.emissive.setScalar(0.04);
+        else own.emissive.copy(own.color).multiplyScalar(0.056);
+        bag.own.push(own);
+      });
+      const r = new THREE.Box3().setFromObject(m);
+      m.position.set(0, -(r.max.y - r.min.y) / 2, 0); // centrada: gira sobre su medio
+      const lay = new THREE.Group().add(m);
+      lay.rotation.x = Math.PI / 2;
+      this.can.add(lay);
+    }
     this.can.visible = false;
     add(this.can);
-    this.boxes.push({ x0: fx, x1: H.x, z0: vz - 0.46, z1: vz + 0.46 });
+    this.boxes.push({ x0: fx, x1: H.x, z0: vz - 0.5, z1: vz + 0.5 });
     this.shadowUnder(this.boxes[0]);
 
     // ── la papelera, el cubo y los tablones ─────────────────────────────────
@@ -400,7 +407,7 @@ export class Decor {
     const bin = new THREE.Mesh(binG, tin);
     bin.position.set(2.72, 0.21, 0.1);
     (tin as THREE.MeshStandardMaterial).side = THREE.DoubleSide;
-    add(bin, box(0.3, 0.01, 0.3, trayM, 2.72, 0.35, 0.1));
+    add(bin, new THREE.Mesh(new THREE.CylinderGeometry(0.165, 0.165, 0.01, 14), trayM).translateX(2.72).translateY(0.35).translateZ(0.1));
     this.boxes.push({ x0: 2.54, x1: 2.9, z0: -0.08, z1: 0.28 });
     this.shadowUnder(this.boxes[1]);
     const bucket = new THREE.Mesh(new THREE.CylinderGeometry(0.15, 0.12, 0.3, 14, 1, true), std(0x3d5560, 0.5, 0.4));
@@ -524,7 +531,7 @@ export class Decor {
     this.beaconHalo.position.set(1.5, 1.62, -H.z + 0.1);
     add(bd, this.beaconHalo);
     bag.own.push(this.beacon, this.beaconHalo.material);
-    this.can.userData.rest = new THREE.Vector3(fx - 0.05, 0.435, vz);
+    this.can.userData.rest = new THREE.Vector3(fx - 0.14, 0.036, vz);
   }
 
   // ── sombras falsas ─────────────────────────────────────────────────────────
@@ -563,6 +570,12 @@ export class Decor {
    * Cada fotograma. `p`: lo encendido que está cada fluorescente (0–1); `pressed`: el botón ya se pulsó;
    * `blackout`: 0–1, la sala a oscuras (la máquina vacila).
    */
+  /** Repinta la pizarra con las misiones y los votos. */
+  setBoard(round: number, levelId: string) {
+    paintBoard((this.board.image as HTMLCanvasElement).getContext('2d')!, round, levelId);
+    this.board.needsUpdate = true;
+  }
+
   update(dt: number, age: number, p: [number, number], pressed: boolean, blackout: number) {
     // los haces y el polvo siguen a los tubos
     this.beams.forEach((b, i) => (b.opacity = 0.07 * p[i]));

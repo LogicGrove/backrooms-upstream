@@ -1,0 +1,47 @@
+{
+  "macarena": {
+    "id": "macarena",
+    "name": "MACARENA",
+    "loop": true,
+    "segs": [
+      {
+        "clip": "Macarena Dance",
+        "in": 0,
+        "out": 0,
+        "rate": 1,
+        "loops": 1,
+        "fade": 0
+      }
+    ]
+  },
+  "party": {
+    "id": "party",
+    "name": "PARTY MIX",
+    "segs": [
+      {
+        "clip": "Fist Pump",
+        "in": 0,
+        "out": 0,
+        "rate": 1,
+        "loops": 1,
+        "fade": 0
+      },
+      {
+        "clip": "Hip Hop Dancing",
+        "in": 0,
+        "out": 0,
+        "rate": 1,
+        "loops": 1,
+        "fade": 0.3
+      },
+      {
+        "clip": "Flair",
+        "in": 0,
+        "out": 0,
+        "rate": 1,
+        "loops": 1,
+        "fade": 0.3
+      }
+    ]
+  }
+}

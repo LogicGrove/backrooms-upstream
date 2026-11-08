@@ -23,7 +23,7 @@ export interface View {
   /** Dónde va el objeto respecto a la vista y cómo se gira (grados). */
   pos: V3;
   rot: V3;
-  /** Solo la camcorder: dónde va al mirar por ella (pegada al ojo). */
+  /** Camcorder, rifle y pistola de agua: dónde va al apuntar (clic derecho). */
   aim?: V3;
 }
 export interface GearGrips {
@@ -31,7 +31,9 @@ export interface GearGrips {
   left?: Hand;
   right?: Hand;
 }
-export type GripSet = Record<'flashlight' | 'camera' | 'gun', GearGrips>;
+/** Lo que se agarra: los tres de siempre más lo que se saca de la barra rápida (cinta, radar y tótem, con la derecha). */
+export type GripId = 'flashlight' | 'camera' | 'gun' | 'caution' | 'radar' | 'totem' | 'watergun' | 'water' | 'soap' | 'tape' | 'ammo';
+export type GripSet = Record<GripId, GearGrips>;
 
 /** Lo guardado en grips.json; `grips` es la copia viva (la herramienta la modifica y el jugador la lee cada fotograma). */
 export const DEFAULT_GRIPS = raw as unknown as GripSet;

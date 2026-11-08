@@ -27,3 +27,5 @@ If you use this 3D model in your project be sure to copy paste this credit where
 This work is based on "Industrial Button" (https://sketchfab.com/3d-models/industrial-button-a7e7c1772d764c3b913cccac66932236) by Zeppelin (https://sketchfab.com/zeppelingames) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
 
 Reducidos con tools/pack_glb.py (texturas a 512 px, sin mapas de normales).
+
+This work is based on "Vending machine" (https://sketchfab.com/3d-models/vending-machine-9974acbcd8794694987f1e69924f80d9) by hectopod (https://sketchfab.com/hectopod) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

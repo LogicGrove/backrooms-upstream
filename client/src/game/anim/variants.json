@@ -1,0 +1,23 @@
+[
+  {
+    "id": "strut",
+    "name": "STRUT WALK",
+    "slots": {
+      "walk": "Strut Walking"
+    }
+  },
+  {
+    "id": "sad",
+    "name": "SAD WALK",
+    "slots": {
+      "walk": "Sad Walk"
+    }
+  },
+  {
+    "id": "happy",
+    "name": "HAPPY IDLE",
+    "slots": {
+      "idle": "Happy Idle"
+    }
+  }
+]

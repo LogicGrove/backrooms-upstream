@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CELL, type Cell, type Maze } from './maze';
+import { CELL, ZONE, type Cell, type Maze } from './maze';
 
 /*
  * La luz de las backrooms, horneada al crear cada mapa: una textura vista desde arriba (4 texels por
@@ -12,6 +12,9 @@ import { CELL, type Cell, type Maze } from './maze';
  *
  * Es una textura de datos en un uniform: cambiarla de un mapa a otro no crea programas nuevos.
  */
+
+/** Intensidad de la linterna con la pila llena (candelas de un SpotLight). */
+export const FLASH = 45;
 
 const R = 4; // texels por celda
 const COLOR = [1, 0.93, 0.74]; // fluorescente viejo, tirando a amarillo
@@ -105,7 +108,7 @@ export function bakeLight(m: Maze, flick: { c: Cell; g: number }[] = []) {
         continue;
       }
       // la luz: cada panel visible (tres puntos suyos), con caída suave (están a 2,65 m: nunca de golpe)
-      let sum = 0.02;
+      let sum = 0.05; // un mínimo: hasta las zonas apagadas dejan ver algo con la linterna encima
       const bx = Math.floor(px / B), bz = Math.floor(pz / B);
       for (let y = bz - near; y <= bz + near; y++)
         for (let x = bx - near; x <= bx + near; x++) {
@@ -192,12 +195,15 @@ export function bakeLight(m: Maze, flick: { c: Cell; g: number }[] = []) {
   const L = L0.map((v, k) => v * 0.82 + Lw[k] * 0.3);
   const A = blur(ao), F = [0, 1, 2, 3].map((g) => blur(fl, 4, g));
   const data = new Uint8Array(n * 4), data2 = new Uint8Array(n * 4);
+  // cada tipo de zona, un tono de luz: se reconoce de lejos dónde se está
+  const TINT: Record<number, number[]> = { [ZONE.pits]: [1, 0.96, 0.66], [ZONE.cubicles]: [0.9, 1, 0.96], [ZONE.office]: [0.96, 0.98, 1], [ZONE.shelves]: [1, 0.9, 0.74] };
   for (let k = 0; k < n; k++) {
+    const tint = TINT[m.zone[Math.floor(k / W / R) * m.w + Math.floor(((k % W) / R))]] ?? [1, 1, 1];
     // lo que llega menos se vuelve más cobrizo (la luz vieja se apaga hacia el naranja)
     const t = Math.min(1, L[k] / 2), v = t * 255, warm = 1 - t;
-    data[k * 4] = v * COLOR[0];
-    data[k * 4 + 1] = v * (COLOR[1] - 0.08 * warm);
-    data[k * 4 + 2] = v * (COLOR[2] - 0.22 * warm);
+    data[k * 4] = v * COLOR[0] * tint[0];
+    data[k * 4 + 1] = v * (COLOR[1] - 0.08 * warm) * tint[1];
+    data[k * 4 + 2] = v * (COLOR[2] - 0.22 * warm) * tint[2];
     data[k * 4 + 3] = A[k] * 255;
     for (let g = 0; g < 4; g++) data2[k * 4 + g] = Math.min(1, F[g][k] / 2) * 255;
   }

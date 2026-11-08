@@ -1,6 +1,6 @@
 import {
-  Breath, seesXZ, CELL, DIFFICULTY, EntitySim, TAPES_NEEDED, centerOf, generateMaze, hideStates, itemSpots, solidAt, tickHides,
-  type Difficulty, type Look, type HideState, type EntState, type ItemSpot, type Kind, type Maze, type PlayerState, type SimTarget, type WorldSnapshot,
+  Breath, levelCaps, seesXZ, CELL, DIFFICULTY, HIT_DAMAGE, EntitySim, TV_REACH, centerOf, generateMaze, poolMaze, hideStates, itemSpots, solidAt, tickHides, totemSpot, tvPoint, tvSites,
+  type Difficulty, type Inventory, type Look, type Mission, type HideState, type EntState, type ItemSpot, type Kind, type Maze, type PlayerState, type SimTarget, type WorldSnapshot,
 } from '@backrooms/shared';
 
 /*
@@ -26,6 +26,25 @@ export interface Player {
   /** La cuenta con la que entró (0 = invitado: no acumula nada) y su aspecto, validado por el servidor. */
   uid: number;
   look: Look;
+  /** Vida (0–100, sin regeneración) y latas de Almond Water que lleva. */
+  hp: number;
+  water: number;
+  /** Tótems de la vida que lleva, a quién está reviviendo en «Run for your life» (este jugador, muerto, corriendo) y hasta cuándo es inmune al volver. */
+  totem: number;
+  reviving?: { by: string; at: number };
+  immuneUntil?: number;
+  /** Admin: munición infinita (el servidor se lo ordena al cliente y lo recuerda entre rondas). */
+  infAmmo?: boolean;
+  /** Listo en la sala de espera (informativo). */
+  ready?: boolean;
+  /** Lo que conserva entre rondas (la tienda y lo que trajo del ascensor) y lo que puede llevar ahora (inicio + recogido - soltado): el tope de lo que declara al subir. */
+  inv: Inventory;
+  cap: Inventory;
+  /** Ha subido vivo al ascensor: ya no juega (las entidades no lo ven) hasta que acabe la ronda. */
+  boarded?: boolean;
+  /** Cuándo soltó (o compró) algo por última vez (anti-spam). */
+  lastDrop?: number;
+  lastBuy?: number;
   /** Fotos de esta partida (ids de entidad ya contados), la última y si lo están inspeccionando ahora. */
   shot?: Set<number>;
   lastPhoto?: number;
@@ -34,6 +53,34 @@ export interface Player {
   hide?: number;
   breath?: Breath;
   noise?: number;
+  /** Pistola de agua: estado de mojado/parada (ver applyWet). */
+  wet?: WetState;
+}
+
+/** Mojado/parada de quien recibe el chorro (jugador; sirve igual para una entidad). Tiempos en ms de reloj. */
+export interface WetState {
+  last: number;
+  acc: number;
+  wetUntil: number;
+  stunUntil: number;
+  coolUntil: number;
+}
+const WET_MS = 4000, STUN_MS = 3000, STUN_AFTER = 1200, STUN_COOL = 6000, SQUIRT_REACH = 6, SQUIRT_COS = Math.cos((12 * Math.PI) / 180);
+/** Un impacto de chorro en `now`: devuelve el efecto a notificar (o nada). Acumula chorro continuo (huecos > 250 ms lo reinician); tras la parada, enfriamiento. */
+export function applyWet(w: WetState, now: number): { kind: 'wet' | 'stun'; ms: number } | undefined {
+  w.acc = now - w.last > 250 ? 0 : w.acc + (now - w.last);
+  w.last = now;
+  if (now < w.stunUntil) return;
+  if (w.acc >= STUN_AFTER && now >= w.coolUntil) {
+    w.stunUntil = now + STUN_MS;
+    w.coolUntil = w.stunUntil + STUN_COOL;
+    w.acc = 0;
+    return { kind: 'stun', ms: STUN_MS };
+  }
+  if (now > w.wetUntil - WET_MS + 1000) { // se renueva como mucho una vez por segundo
+    w.wetUntil = now + WET_MS;
+    return { kind: 'wet', ms: WET_MS };
+  }
 }
 
 interface Ent {
@@ -48,6 +95,13 @@ export class Match {
   private ents: Ent[] = [];
   private nextId = 1;
   private age = 0;
+  /** La misión de la ronda, las televisiones que hay que apagar (de tvSites), las ya apagadas y las fotos válidas (por jugador y entidad) de todos. */
+  mission?: Mission;
+  tvs: { cell: { x: number; y: number }; rot: number }[] = [];
+  readonly tvOff = new Set<number>();
+  private photos = 0;
+  /** Admin: las entidades se quedan quietas. */
+  frozen = false;
 
   private speed: number;
   private grace: number;
@@ -56,15 +110,58 @@ export class Match {
   /** Los nichos de las paredes, con quien hay dentro. */
   readonly hides: HideState[];
 
-  constructor(readonly seed: number, difficulty: Difficulty = 'normal', players = 1) {
+  /** Nivel sin entidades (las Poolrooms, mientras no tengan sus propias). */
+  private noEnts: boolean;
+
+  constructor(readonly seed: number, difficulty: Difficulty = 'normal', players = 1, levelId = 'level0') {
     this.speed = DIFFICULTY[difficulty].speed;
     this.grace = DIFFICULTY[difficulty].grace;
-    this.maze = generateMaze(seed, players);
+    const caps = levelCaps(levelId);
+    this.noEnts = !caps.ents;
+    this.maze = caps.pool ? poolMaze(seed) : generateMaze(seed, players);
+    this.maze.totem = this.noEnts ? null : totemSpot(this.maze, seed, players);
     this.hides = hideStates(this.maze);
+    const D = DIFFICULTY[difficulty];
     for (const it of itemSpots(this.maze)) this.items.set(it.id, it);
-    // al empezar, una de cada, en los arranques más lejanos
+    // el loot según la dificultad: solo lo prescindible (latas, linternas, rifles extra); lo que pide una misión o da una ventaja grande no. Lo quitado cuenta como ya cogido: el cliente no lo pinta
+    for (const it of [...this.items.values()]) {
+      const n = Number(it.id.slice(1)) || 0;
+      if (!caps.pool && (it.kind === 'water' || it.kind === 'flashlight' || (it.kind === 'gun' && it.id !== 'g')) && ((n * 2654435761) >>> 0) / 2 ** 32 >= D.loot) (this.items.delete(it.id), this.taken.add(it.id));
+    }
+    // al empezar, entidades según la dificultad (alternando bacteria y partygoer), en los arranques más lejanos
     const m = this.maze;
-    (['bacteria', 'partygoer'] as Kind[]).forEach((k, i) => this.spawn(k, m.spawns[i] ?? m.spawns[0]));
+    if (!this.noEnts) for (let i = 0; i < D.ents; i++) this.spawn(i % 2 ? 'partygoer' : 'bacteria', m.spawns[i] ?? m.spawns[i % Math.max(1, m.spawns.length)] ?? m.spawns[0]);
+  }
+
+  /** Se juega esta misión (la elegida en la pizarra). */
+  setMission(m: Mission) {
+    this.mission = m;
+    // las cintas solo hay si la misión es encontrarlas
+    if (m.kind !== 'tapes' && m.kind !== 'soaps') for (const id of [...this.items.keys()]) if (id[0] === 't' && this.items.get(id)?.kind === 'tape') this.items.delete(id);
+    this.tvs =m.kind === 'tvs' ? tvSites(this.maze, m.goal) : [];
+  }
+
+  /** Segundos de partida. */
+  get elapsed() {
+    return this.age;
+  }
+
+  /** El progreso de la misión (fotos, cintas, segundos o televisiones apagadas), sin pasar de la meta. */
+  get progress() {
+    const m = this.mission;
+    if (!m) return 0;
+    const v = m.kind === 'photos' ? this.photos : m.kind === 'tapes' || m.kind === 'soaps' ? this.tapes : m.kind === 'survive' ? Math.floor(this.age) : this.tvOff.size;
+    return Math.min(m.goal, v);
+  }
+
+  /** Apagar la televisión `i`: hay que estar cerca de ella. */
+  tv(p: Player, i: number) {
+    const s = this.tvs[i];
+    if (!s || this.tvOff.has(i) || p.dead || p.boarded) return false;
+    const c = tvPoint(s);
+    if (Math.hypot(p.st.x - c.x, p.st.z - c.z) > TV_REACH + 1.2) return false;
+    this.tvOff.add(i);
+    return true;
   }
 
   /** Dónde empiezan todos. */
@@ -75,6 +172,29 @@ export class Match {
   private spawn(kind: Kind, at: { x: number; y: number }, speed = 1, hp = 1) {
     const m = this.maze;
     this.ents.push({ id: this.nextId++, sim: new EntitySim(kind, m, (x, z) => solidAt(m, x, z), at, speed * this.speed, hp, true) });
+  }
+
+  /** Admin: una entidad en una celda abierta cerca de (x, z) (a 3–7 celdas), o en el arranque más lejano si no hay. */
+  adminSpawn(kind: Kind, x: number, z: number) {
+    const m = this.maze, cx = Math.floor(x / CELL), cy = Math.floor(z / CELL);
+    const open: { x: number; y: number }[] = [];
+    for (let y = Math.max(0, cy - 7); y <= Math.min(m.h - 1, cy + 7); y++)
+      for (let xx = Math.max(0, cx - 7); xx <= Math.min(m.w - 1, cx + 7); xx++) {
+        const d = Math.max(Math.abs(xx - cx), Math.abs(y - cy));
+        if (d >= 3 && m.open[y * m.w + xx]) open.push({ x: xx, y });
+      }
+    this.spawn(kind, open[(Math.random() * open.length) | 0] ?? m.spawns[0], 1, 1);
+  }
+  /** Admin: quita todas las entidades. */
+  clearEnts() {
+    this.ents = [];
+  }
+  get entCount() {
+    return this.ents.length;
+  }
+  /** Admin: apaga todas las televisiones de la misión. */
+  allTvsOff() {
+    this.tvs.forEach((_, i) => this.tvOff.add(i));
   }
 
   /** Las cintas recogidas entre todos. */
@@ -92,24 +212,26 @@ export class Match {
     const hidden = this.age > this.grace ? this.hides.filter((h) => h.occ) : [];
     if (this.age > this.grace) {
       for (const p of players) {
-        if (p.dead || !p.seen || (p.hide ?? -1) >= 0) continue;
+        if (p.dead || p.boarded || !p.seen || (p.hide ?? -1) >= 0 || (p.immuneUntil ?? 0) > Date.now()) continue; // (inmune: recién vuelto con el Tótem)
         const s = p.st, cx = Math.floor(s.x / CELL), cy = Math.floor(s.z / CELL), m = this.maze;
         const cp = Math.cos(s.pitch);
         targets.push({
-          id: p.id, x: s.x, y: s.y, z: s.z, ex: s.x, ey: s.y + EYE, ez: s.z,
+          id: p.id, x: s.x, y: s.y, z: s.z, ex: s.x, ey: s.y + EYE - (s.duck ? 0.6 : 0), ez: s.z, duck: !!s.duck,
           torch: s.light ? [-Math.sin(s.yaw) * cp, Math.sin(s.pitch), -Math.cos(s.yaw) * cp] : null,
           exposed: cx >= 0 && cy >= 0 && cx < m.w && cy < m.h && !!m.lit[cy * m.w + cx],
         });
       }
     }
-    for (const e of this.ents) {
+    for (const e of this.frozen ? [] : this.ents) {
       const id = e.sim.update(dt, targets, false, hidden);
       if (id === undefined) continue;
       const p = players.find((q) => q.id === id);
       if (!p) continue;
+      // un golpe quita vida; muere con la vida a cero o si lo pillan en un nicho (sin salida)
+      p.hp = (p.hide ?? -1) >= 0 ? 0 : Math.max(0, p.hp - HIT_DAMAGE);
+      e.sim.state = 'attack'; // ataca y vuelve a lo suyo (ver recover)
+      if (p.hp > 0) continue; // sigue vivo
       p.dead = true;
-      e.sim.dance(p.st.x, p.st.z);
-      e.sim.state = 'attack'; // primero el ataque; el baile llega solo (ver recover)
       caught(p, e.id);
     }
   }
@@ -120,6 +242,7 @@ export class Match {
       taken: [...this.taken],
       tapes: this.tapes,
       insp: this.hides.filter((h) => h.by && h.occ).map((h) => h.occ!.id),
+      ...(this.tvs.length ? { tvOff: [...this.tvOff] } : {}),
     };
   }
 
@@ -177,6 +300,7 @@ export class Match {
     if (Math.hypot(p.st.x - e.sim.x, p.st.z - e.sim.z) > SHOT_REACH) return false;
     if (!e.sim.hit()) return false;
     this.ents.splice(i, 1);
+    if (this.noEnts) return true;
     // la siguiente, en el arranque más lejano del que disparó: 15 % más rápida y un tiro más
     const far = [...this.maze.spawns].sort((a, b) => dist(centerOf(b), p.st) - dist(centerOf(a), p.st))[0];
     this.spawn(e.sim.kind === 'bacteria' ? 'partygoer' : 'bacteria', far, Math.min(1.2, (e.sim.speed / this.speed) * 1.1), e.sim.hp0 + 1);
@@ -197,19 +321,38 @@ export class Match {
       const dx = e.sim.x - s.x, dz = e.sim.z - s.z, d = Math.hypot(dx, dz);
       if (d > PHOTO_REACH || (d > 1 && (dx * fx + dz * fz) / d < PHOTO_COS) || !seesXZ((x, z) => solidAt(m, x, z), s.x, s.z, e.sim.x, e.sim.z)) continue;
       (p.shot ??= new Set()).add(e.id);
+      this.photos++;
       return e.id;
     }
   }
 
-  /** Llegar al ascensor con las cintas de todos. */
-  canExit(p: Player) {
+  /** Un chorro de la pistola de agua: moja al jugador más cercano dentro del cono (6 m, ±12°). Devuelve a quién y el efecto, si lo hay. */
+  squirt(p: Player, players: Player[], a: { x: number; z: number; yaw: number }, now = Date.now()) {
+    if (p.dead || p.boarded || !p.cap.watergun) return;
+    const near = Math.hypot(a.x - p.st.x, a.z - p.st.z) < 3, x = near ? a.x : p.st.x, z = near ? a.z : p.st.z;
+    const fx = -Math.sin(a.yaw), fz = -Math.cos(a.yaw);
+    let best: Player | undefined, bd = SQUIRT_REACH;
+    for (const q of players) {
+      if (q === p || q.dead || q.boarded || !q.seen) continue;
+      const dx = q.st.x - x, dz = q.st.z - z, d = Math.hypot(dx, dz);
+      if (d < bd && (d < 0.3 || (dx * fx + dz * fz) / d >= SQUIRT_COS)) (bd = d), (best = q);
+    }
+    if (!best) return;
+    const ev = applyWet((best.wet ??= { last: 0, acc: 0, wetUntil: 0, stunUntil: 0, coolUntil: 0 }), now);
+    return ev && { to: best, ev };
+  }
+
+  /** Entrar en el ascensor (abierto: la misión está cumplida). */
+  canBoard(p: Player) {
     const c = centerOf(this.maze.elevator);
-    return !p.dead && this.tapes >= TAPES_NEEDED && Math.hypot(p.st.x - c.x, p.st.z - c.z) < 2.5;
+    return !p.dead && !p.boarded && Math.hypot(p.st.x - c.x, p.st.z - c.z) < 2.5;
   }
 
   /** Ha caído al vacío de verdad (no un salto). */
   fell(p: Player) {
-    return !p.dead && p.st.y < -1;
+    if (p.dead || p.st.y >= -1) return false;
+    p.hp = 0;
+    return true;
   }
 }
 

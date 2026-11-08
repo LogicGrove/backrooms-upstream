@@ -1,3 +1,4 @@
+import { DEV_LOCAL } from '../devGate';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
@@ -45,7 +46,10 @@ export const model = (id: string) => {
         (g) => {
           // sin mapa de entorno un metal puro se ve negro: las piezas se quedan con un poco de metal y su color
           g.scene.traverse((o) => {
-            const k = (o as THREE.Mesh).material as THREE.MeshStandardMaterial | undefined;
+            const m = o as THREE.Mesh;
+            // el bicornio trae un atlas hecho jirones (islas de UV sueltas, sin sentido): se sustituye por fieltro liso
+            if (id === 'bicorn_hat' && m.isMesh) m.material = new THREE.MeshStandardMaterial({ color: 0x23242e, roughness: 0.92, side: THREE.DoubleSide });
+            const k = m.material as THREE.MeshStandardMaterial | undefined;
             if (k?.isMeshStandardMaterial) k.metalness = Math.min(k.metalness, 0.25);
           });
           return g.scene;
@@ -155,4 +159,4 @@ export class Cosmetics {
 }
 
 // desarrollo: __pieces en la consola para ajustar las medidas de cada pieza en la vista previa del armario
-if (process.env.NODE_ENV === 'development') Object.assign(window, { __pieces: PIECES });
+if (DEV_LOCAL) Object.assign(window, { __pieces: PIECES });

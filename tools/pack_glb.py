@@ -37,11 +37,13 @@ def main() -> int:
     g = json.loads((src / "scene.gltf").read_text(encoding="utf-8"))
     binary = (src / g["buffers"][0]["uri"]).read_bytes()
 
+    g.setdefault("textures", []), g.setdefault("images", [])  # modelos sin texturas (solo colores)
     # 1. fuera lo que pesa y no se ve: normales y transmisión
     used_tex: list[int] = []
     for m in g.get("materials", []):
         m.pop("normalTexture", None)
         m.get("extensions", {}).pop("KHR_materials_transmission", None)
+        m.get("extensions", {}).pop("KHR_materials_specular", None)  # sus texturas (specularf0) tampoco se remapean: fuera
         if not m.get("extensions"):
             m.pop("extensions", None)
         holders = [m, m.get("pbrMetallicRoughness", {})]
@@ -66,7 +68,7 @@ def main() -> int:
         t["source"] = used_img.index(t["source"])
     old_img = g["images"]
     g["images"] = []
-    g["extensionsUsed"] = [e for e in g.get("extensionsUsed", []) if e != "KHR_materials_transmission"]
+    g["extensionsUsed"] = [e for e in g.get("extensionsUsed", []) if e not in ("KHR_materials_transmission", "KHR_materials_specular")]
     if not g["extensionsUsed"]:
         g.pop("extensionsUsed")
     g.pop("extensionsRequired", None)

@@ -185,6 +185,12 @@ export class GameAudio {
     if (this.open > 0.55) for (const [t, k] of [[0.11, 0.35], [0.23, 0.15]]) this.burst(0.12, (run ? 0.22 : 0.15) * k * this.open * vol, 220, 0.7, 'lowpass', t, dest);
   }
 
+  /** Poolrooms: un paso por el agua o una brazada (chapoteo suave). */
+  wade(run = false) {
+    this.burst(0.22, run ? 0.16 : 0.1, 900, 0.7, 'lowpass');
+    this.burst(0.12, 0.05, 2600, 1.5, 'bandpass', 0.05);
+  }
+
   /** La alarma de la entrada: una sirena grave que sube y baja, hasta que se apaga. */
   private siren?: { o: OscillatorNode[]; g: GainNode };
   alarm(on: boolean) {
@@ -298,6 +304,32 @@ export class GameAudio {
     this.burst(1.2, 0.05, 900, 3, 'bandpass', 0.15);
   }
 
+  private tvGain?: GainNode;
+  /** El siseo de las teles encendidas (misión «TURN OFF THE TVS»): `v` (0–1) es lo cerca que está la más próxima; 0 lo apaga. */
+  tvStatic(v: number) {
+    if (!this.tvGain) {
+      if (v <= 0) return;
+      const g = this.ctx.createGain(), bp = this.ctx.createBiquadFilter(), whine = this.ctx.createOscillator(), wg = this.ctx.createGain();
+      g.gain.value = 0;
+      bp.type = 'bandpass';
+      bp.frequency.value = 3400;
+      bp.Q.value = 0.5;
+      whine.frequency.value = 15700; // el pitido agudo del tubo
+      wg.gain.value = 0.01;
+      whine.connect(wg).connect(g);
+      whine.start();
+      this.nodes.push(whine, wg);
+      this.loop(this.noiseSrc(), bp, g);
+      this.tvGain = g;
+    }
+    this.tvGain.gain.setTargetAtTime(0.16 * v * v, this.ctx.currentTime, 0.12);
+  }
+  /** Una tele que se apaga: el golpe seco del interruptor y el pitido que se cae. */
+  tvOff() {
+    this.burst(0.05, 0.35, 700, 1.5, 'lowpass');
+    this.tone(2400, 0.35, 0.05, 'sine', 0.03, 120);
+  }
+
   /** El interruptor de la linterna. */
   click() {
     this.burst(0.012, 0.3, 4200, 4, 'bandpass');
@@ -306,6 +338,18 @@ export class GameAudio {
   pickup() {
     this.burst(0.08, 0.15, 600, 1.5);
     this.tone(880, 0.06, 0.03, 'square', 0.05);
+  }
+  /** Un trozo del chorro de la pistola de agua (se llama a ~8 Hz mientras se dispara) y el glu-glu de la recarga. */
+  squirt() {
+    this.burst(0.14, 0.09, 2600, 0.9, 'bandpass');
+  }
+  refill() {
+    this.burst(0.2, 0.1, 500, 3, 'bandpass');
+  }
+  /** Un trago de la lata: dos glup. */
+  drink() {
+    this.burst(0.1, 0.12, 320, 2);
+    setTimeout(() => this.burst(0.12, 0.12, 260, 2), 170);
   }
   reject() {
     this.tone(110, 0.4, 0.08, 'square');
@@ -335,6 +379,10 @@ export class GameAudio {
   reload() {
     this.burst(0.05, 0.35, 2200, 3);
     this.burst(0.06, 0.4, 1200, 3, 'bandpass', 0.35);
+  }
+  /** Misión cumplida (el ascensor se abre): dos notas que suben. */
+  done() {
+    [0, 0.18, 0.36].forEach((t, i) => this.tone([660, 880, 1320][i], 0.4, 0.07, 'sine', t));
   }
   elevator() {
     [0, 0.45].forEach((t) => this.tone(1320, 0.5, 0.06, 'sine', t));

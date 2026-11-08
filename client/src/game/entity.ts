@@ -13,7 +13,7 @@ import { Timeline, Track, worldTl, type Snap } from './interp';
  */
 
 export type { Kind };
-const CLIPS: Record<Kind, { idle: string; walk: string; run: string; attack: string; dances: string[] }> = {
+export const CLIPS: Record<Kind, { idle: string; walk: string; run: string; attack: string; dances: string[] }> = {
   bacteria: { idle: 'Idle', walk: 'Walking', run: 'Run', attack: 'Jump Attack', dances: ['Booty Hip Hop Dance', 'Twist Dance'] },
   partygoer: { idle: 'Happy Idle', walk: 'Dwarf Walk', run: 'Drunk Run Forward', attack: 'Standing Melee Attack Horizontal', dances: ['Macarena Dance'] },
 };
@@ -35,7 +35,7 @@ export class Entity implements Target {
   onHit?: (id: number) => void;
   private goal = new THREE.Vector3();
   private goalYaw = 0;
-  private track = new Track(worldTl, false);
+  track = new Track(worldTl, false);
   private out: Snap = { t: 0, x: 0, y: 0, z: 0, yaw: 0, pitch: 0 };
   private netState: EntState['state'] = 'wander';
   private moving = false;
@@ -56,7 +56,7 @@ export class Entity implements Target {
     this.goal.copy(this.pos);
     this.rig.root.position.copy(this.pos);
     world.root.add(this.rig.root);
-    if (!remote) this.sim = new EntitySim(kind, world.maze, (x, z) => world.solid(x, z), at, speed, hp);
+    if (!remote) this.sim = new EntitySim(kind, world.maze, (x, z) => world.solid(x, z), at, speed, hp, true); // recover: un golpe que no mata, y vuelve a lo suyo
     if (kind === 'partygoer') {
       // el globo, con el cordel en la mano derecha (se coloca cada fotograma: ver update)
       const b = assets.gltf.balloon.scene.clone(true), box = new THREE.Box3().setFromObject(b);
@@ -86,11 +86,11 @@ export class Entity implements Target {
    * los fluorescentes encendidos. Devuelve true el fotograma en que alcanza al jugador (solo en solitario).
    * `hidden`: el jugador está en un nicho (no es objetivo); `hides`: los nichos con alguien dentro (pueden inspeccionarlo).
    */
-  update(dt: number, player: THREE.Vector3, eye: THREE.Vector3, torch: THREE.Vector3 | null, exposed: boolean, god: boolean, hides: HideState[] = [], hidden = false) {
+  update(dt: number, player: THREE.Vector3, eye: THREE.Vector3, torch: THREE.Vector3 | null, exposed: boolean, god: boolean, hides: HideState[] = [], hidden = false, duck = false) {
     const clip = CLIPS[this.kind];
     let caught = false;
     if (this.sim) {
-      const t: SimTarget = { id: 'me', x: player.x, y: player.y, z: player.z, ex: eye.x, ey: eye.y, ez: eye.z, torch: torch ? [torch.x, torch.y, torch.z] : null, exposed };
+      const t: SimTarget = { id: 'me', x: player.x, y: player.y, z: player.z, ex: eye.x, ey: eye.y, ez: eye.z, torch: torch ? [torch.x, torch.y, torch.z] : null, exposed, duck };
       caught = this.sim.update(dt, hidden ? [] : [t], god, hides) !== undefined;
       if (this.sim.state === 'wander' || this.sim.state === 'chase' || this.sim.state === 'inspect') this.pos.set(this.sim.x, 0, this.sim.z);
       this.facing = this.sim.facing;
