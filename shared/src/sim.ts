@@ -99,7 +99,10 @@ export function hideStates(m: Maze): HideState[] {
     return { idx, x: n.x, z: n.z, fx: n.x + dx * CELL, fz: n.z + dy * CELL, yaw: Math.atan2(-dx, -dy), occ: null, cd: 0, by: null };
   });
 }
-export const tickHides = (hs: HideState[], dt: number) => hs.forEach((h) => (h.cd = Math.max(0, h.cd - dt)));
+export function tickHides(hs: HideState[], dt: number) {
+  if (!Number.isFinite(dt) || dt <= 0) return;
+  hs.forEach((h) => (h.cd = Math.max(0, h.cd - dt)));
+}
 
 /**
  * Contener la respiración: 6 s seguidos (1 = lleno), se recupera en 4 al soltar; si se agota, un jadeo y
@@ -113,6 +116,7 @@ export class Breath {
   /** Un paso; devuelve si de verdad contiene (quiere, y le queda aire). */
   step(dt: number, want: boolean, slack = 1) {
     this.gasped = false;
+    if (!Number.isFinite(dt) || dt < 0) return false;
     const hold = want && !this.winded && this.air > 0;
     this.air = Math.max(0, Math.min(1, this.air + (hold ? -1 / (6 * slack) : 1 / 4) * dt));
     if (hold && this.air <= 0) (this.winded = true), (this.gasped = true);
@@ -132,12 +136,33 @@ export function solidAt(m: Maze, x: number, z: number, elevatorOpen = false) {
   return !elevatorOpen && cx === m.elevator.x && cy === m.elevator.y;
 }
 
-/** ¿Se ve (bx,bz) desde (ax,az) sin pared en medio? (pasos de 25 cm por la rejilla) */
+/** ¿Se ve (bx,bz) desde (ax,az)? Recorre todas las celdas atravesadas, incluso al rozar una esquina. */
 export function seesXZ(solid: (x: number, z: number) => boolean, ax: number, az: number, bx: number, bz: number) {
-  const d = Math.hypot(bx - ax, bz - az), n = Math.ceil(d / 0.25);
-  for (let i = 1; i < n; i++) {
-    const t = i / n;
-    if (solid(ax + (bx - ax) * t, az + (bz - az) * t)) return false;
+  if (![ax, az, bx, bz].every(Number.isFinite) || solid(ax, az) || solid(bx, bz)) return false;
+  const dx = bx - ax, dz = bz - az, sx = Math.sign(dx), sz = Math.sign(dz);
+  let x = Math.floor(ax / CELL), z = Math.floor(az / CELL);
+  const endX = Math.floor(bx / CELL), endZ = Math.floor(bz / CELL);
+  const strideX = dx ? CELL / Math.abs(dx) : Infinity, strideZ = dz ? CELL / Math.abs(dz) : Infinity;
+  let nextX = dx ? ((sx > 0 ? (x + 1) * CELL : x * CELL) - ax) / dx : Infinity;
+  let nextZ = dz ? ((sz > 0 ? (z + 1) * CELL : z * CELL) - az) / dz : Infinity;
+  const blocked = (cx: number, cz: number) => solid((cx + 0.5) * CELL, (cz + 0.5) * CELL);
+  while (x !== endX || z !== endZ) {
+    if (x === endX) nextX = Infinity;
+    if (z === endZ) nextZ = Infinity;
+    if (nextX < nextZ) {
+      x += sx;
+      nextX += strideX;
+    } else if (nextZ < nextX) {
+      z += sz;
+      nextZ += strideZ;
+    } else {
+      if (blocked(x + sx, z) || blocked(x, z + sz)) return false;
+      x += sx;
+      z += sz;
+      nextX += strideX;
+      nextZ += strideZ;
+    }
+    if (blocked(x, z)) return false;
   }
   return true;
 }
@@ -222,12 +247,9 @@ export class EntitySim {
   private clear(ax: number, az: number, bx: number, bz: number) {
     const dx = bx - ax, dz = bz - az, d = Math.hypot(dx, dz);
     if (d < 1e-6) return true;
-    const nx = (-dz / d) * 0.3, nz = (dx / d) * 0.3, n = Math.ceil(d / 0.3);
-    for (let i = 1; i <= n; i++)
-      for (const k of [-1, 0, 1]) {
-        const x = ax + (dx * i) / n + nx * k, z = az + (dz * i) / n + nz * k;
-        if (this.solid(x, z) || this.blockedAt(x, z)) return false;
-      }
+    const nx = (-dz / d) * 0.3, nz = (dx / d) * 0.3;
+    for (const k of [-1, 0, 1])
+      if (!seesXZ((x, z) => this.solid(x, z) || this.blockedAt(x, z), ax + nx * k, az + nz * k, bx + nx * k, bz + nz * k)) return false;
     return true;
   }
 
@@ -277,7 +299,8 @@ export class EntitySim {
     if (this.tpCd > 0) return;
     if ((this.tpChk -= dt) > 0) return;
     this.tpChk = 1;
-    const m = this.maze, pts = [...targets.map((t) => ({ x: t.x, z: t.z, ex: t.ex, ez: t.ez })), ...hides.filter((h) => h.occ).map((h) => ({ x: h.x, z: h.z, ex: h.x, ez: h.z }))];
+    // El nicho sigue siendo pared en la rejilla: su boca es el ancla transitable y visible.
+    const m = this.maze, pts = [...targets.map((t) => ({ x: t.x, z: t.z, ex: t.ex, ez: t.ez })), ...hides.filter((h) => h.occ).map((h) => ({ x: h.fx, z: h.fz, ex: h.fx, ez: h.fz }))];
     if (!pts.length) return void (this.farT = 0);
     const me = this.cellOf(this.x, this.z), key = (c: Cell) => c.y * m.w + c.x;
     const unseen = pts.every((p) => Math.hypot(p.x - this.x, p.z - this.z) > TP_SAFE && !seesXZ(this.solid, this.x, this.z, p.ex, p.ez));
@@ -336,6 +359,7 @@ export class EntitySim {
    * del jugador al que alcanza en este paso (si lo hay).
    */
   update(dt: number, targets: SimTarget[], god = false, hides: HideState[] = []): string | undefined {
+    if (!Number.isFinite(dt) || dt <= 0) return undefined;
     let caught: string | undefined;
     this.moving = false;
     // dentro de una pared o un nicho (no debería): a la celda abierta más cercana
@@ -383,7 +407,7 @@ export class EntitySim {
         else if (d > 1e-6) {
           const k = Math.min(d, v * dt) / d, nx = this.x + tx * k, nz = this.z + tz * k;
           // (nunca a una pared ni a un nicho: un jugador a medio entrar en uno no lo abre)
-          if (!this.solid(nx, nz) && (!near || !this.blockedAt(nx, nz))) (this.x = nx), (this.z = nz);
+          if (this.clear(this.x, this.z, nx, nz)) (this.x = nx), (this.z = nz);
           this.moving = true;
         }
         this.turn(tx, tz, dt);
@@ -396,7 +420,7 @@ export class EntitySim {
         }
       } else (this.stuckT = 0), (this.stuckAt = { x: this.x, z: this.z });
       if (this.state === 'chase' && !god) {
-        const hit = targets.find((t) => Math.hypot(t.x - this.x, t.z - this.z) < REACH && Math.abs(t.y) < 1.2);
+        const hit = targets.find((t) => Math.hypot(t.x - this.x, t.z - this.z) < REACH && Math.abs(t.y) < 1.2 && seesXZ(this.solid, this.x, this.z, t.x, t.z));
         if (hit) (this.state = 'attack'), (this.phase = 0), (caught = hit.id);
       }
     } else if (this.recover && (this.state === 'attack' || this.state === 'dance')) {
@@ -428,7 +452,7 @@ export class EntitySim {
     for (const h of hides) {
       if (Math.hypot(h.x - this.x, h.z - this.z) > 3 * CELL) this.rolled.delete(h.idx);
       if (!h.occ || h.by || h.cd > 0 || this.rolled.has(h.idx) || Math.hypot(h.x - this.x, h.z - this.z) > HIDE_RANGE) continue;
-      if (!seesXZ(this.solid, this.x, this.z, h.fx, h.fz)) continue;
+      if (!this.clear(this.x, this.z, h.fx, h.fz)) continue;
       this.rolled.add(h.idx);
       if (Math.random() > Math.min(0.9, 0.35 + 0.5 * h.occ.noise)) continue;
       this.state = 'inspect';

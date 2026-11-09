@@ -71,6 +71,8 @@ export class Items {
   /** Una foto que cuenta (multijugador: se avisa al servidor, que lo comprueba). */
   onPhoto?: () => void;
   private pickups: Pickup[] = [];
+  private resources = new Map<string, { dispose(): void }[]>();
+  private disposed = false;
   /** En una sala: pedir al servidor quedarse con un objeto (el primero se lo lleva). */
   claim?: (id: string, done: (ok: boolean) => void) => void;
   private won = false;
@@ -96,12 +98,14 @@ export class Items {
   constructor(private world: World, private assets: Assets, private player: Player, private camera: THREE.Camera, private audio?: GameAudio, withTapes = true) {
     const m = world.maze;
     const put = (id: string, kind: Pickup['kind'], c: Cell, src: THREE.Object3D, size: number, rot = 0, at?: { x: number; z: number }, drop?: boolean) => {
+      const resources: { dispose(): void }[] = [];
       const g = fit(skClone(src), size); // (SkeletonUtils: el tótem lleva piel)
       // que se vea con la linterna: un brillo propio leve, del color de cada material (con su textura), no un gris plano
       g.traverse((o) => {
         const mesh = o as THREE.Mesh, mat = mesh.material as THREE.MeshStandardMaterial | undefined;
         if (!mat?.isMeshStandardMaterial) return;
         const own = (mesh.material = mat.clone()) as THREE.MeshStandardMaterial;
+        resources.push(own);
         // la lata es casi blanca: con el brillo de los demás se quema; se queda mate y casi sin brillo propio
         const glow = kind === 'water' ? 0.04 : 0.22;
         if (kind === 'water') (own.color.multiplyScalar(0.7), (own.roughness = 1), (own.metalness = 0));
@@ -116,6 +120,7 @@ export class Items {
       holder.rotation.set(0, rot, 0);
       this.root.add(holder);
       this.pickups.push({ id, obj: holder, kind, taken: false, drop });
+      this.resources.set(id, resources);
     };
     this.add = put;
     if (withTapes) m.tapes.forEach((c, i) => put('t' + i, 'tape', c, assets.gltf.vhs.scene, 0.19, i * 1.3));
@@ -156,6 +161,7 @@ export class Items {
       // la mano baja a por él; es tuyo cuando llega
       const take = (p: Pickup) => {
         const got = () => {
+          if (this.disposed) return;
           p.obj.visible = false;
           this.audio?.pickup();
           if (p.drop) pl.receive(p.kind as ItemId); // lo soltado vuelve tal cual (y va a la barra o a la mano)
@@ -181,6 +187,7 @@ export class Items {
       if (p && this.claim) {
         p.pending = true;
         this.claim(p.id, (ok) => {
+          if (this.disposed) return;
           p.pending = false;
           // si no: lo ha cogido otro (el aviso del servidor, `sync`/`syncDrops`, lo quita) o no cabe / no llegas: sigue ahí, sin esconderlo por si acaso
           if (ok) take(p);
@@ -268,7 +275,7 @@ export class Items {
   syncDrops(list: Drop[]) {
     const here = new Set(list.map((d) => d.id));
     for (const p of this.pickups)
-      if (p.drop && !here.has(p.id)) (p.taken = true), p.obj.removeFromParent();
+      if (p.drop && !here.has(p.id)) this.remove(p);
     this.pickups = this.pickups.filter((p) => !(p.drop && !here.has(p.id)));
     const g = this.assets.gltf;
     if (!this.kit && list.some((d) => d.kind === 'tank' || d.kind === 'watergun')) void loadPoolKit().then((k) => (this.kit = k)); // (sus modelos están en el kit de las Poolrooms; se reintenta en el siguiente mundo)
@@ -283,13 +290,35 @@ export class Items {
       caution: [g.duct.scene, 0.16],
       radar: [g.radar.scene, 0.2],
       totem: [g.totem.scene, 0.5],
-      ammo: [new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.06, 0.06), new THREE.MeshStandardMaterial({ color: 0xb08d3a, roughness: 0.5, metalness: 0.5 })), 0.12],
     };
     for (const d of list) {
-      if (this.pickups.some((p) => p.id === d.id) || !model[d.kind]) continue;
-      const [src, size] = model[d.kind]!;
+      if (this.pickups.some((p) => p.id === d.id)) continue;
+      // La munición procedural solo se crea al aparecer un objeto nuevo, no en cada snapshot del mundo.
+      const ammo = d.kind === 'ammo' ? new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.06, 0.06), new THREE.MeshStandardMaterial({ color: 0xb08d3a, roughness: 0.5, metalness: 0.5 })) : undefined;
+      const entry = ammo ? [ammo, 0.12] as const : model[d.kind];
+      if (!entry) continue;
+      const [src, size] = entry;
       this.add(d.id, d.kind as Pickup['kind'], this.world.cellAt(d.x, d.z), src, size, (d.x * 3.1 + d.z) % 6.28, { x: d.x, z: d.z }, true);
+      if (ammo) {
+        this.resources.get(d.id)!.push(ammo.geometry);
+        ammo.material.dispose(); // put ha clonado el material, la geometría sí pertenece al objeto soltado
+      }
     }
+  }
+
+  private remove(p: Pickup) {
+    p.taken = true;
+    p.obj.removeFromParent();
+    this.resources.get(p.id)?.forEach((resource) => resource.dispose());
+    this.resources.delete(p.id);
+  }
+
+  /** Libera las copias propias, conservando geometrías, texturas y materiales de los assets compartidos. */
+  dispose() {
+    this.disposed = true;
+    for (const p of this.pickups) this.remove(p);
+    this.pickups = [];
+    this.root.removeFromParent();
   }
 
   get photos() {

@@ -113,7 +113,7 @@ export class Match {
   /** Nivel sin entidades (las Poolrooms, mientras no tengan sus propias). */
   private noEnts: boolean;
 
-  constructor(readonly seed: number, difficulty: Difficulty = 'normal', players = 1, levelId = 'level0') {
+  constructor(readonly seed: number, difficulty: Difficulty = 'normal', players = 1, private readonly levelId = 'level0') {
     this.speed = DIFFICULTY[difficulty].speed;
     this.grace = DIFFICULTY[difficulty].grace;
     const caps = levelCaps(levelId);
@@ -226,7 +226,7 @@ export class Match {
       const id = e.sim.update(dt, targets, false, hidden);
       if (id === undefined) continue;
       const p = players.find((q) => q.id === id);
-      if (!p) continue;
+      if (!p || p.dead || p.boarded) continue;
       // un golpe quita vida; muere con la vida a cero o si lo pillan en un nicho (sin salida)
       p.hp = (p.hide ?? -1) >= 0 ? 0 : Math.max(0, p.hp - HIT_DAMAGE);
       e.sim.state = 'attack'; // ataca y vuelve a lo suyo (ver recover)
@@ -292,12 +292,17 @@ export class Match {
     return true;
   }
 
-  /** Un tiro a una entidad: se acepta si va con el rifle y está a tiro; muere al llegar su hp a cero (true) y otra la sustituye. */
-  hit(p: Player, entityId: number) {
+  /** En el nivel 0, las paredes y la puerta cerrada del ascensor cortan los tiros. Las Poolrooms tienen dos plantas y requieren su geometría 3D. */
+  shotVisible(from: { x: number; z: number }, to: { x: number; z: number }, elevatorOpen = false) {
+    return this.levelId !== 'level0' || seesXZ((x, z) => solidAt(this.maze, x, z, elevatorOpen), from.x, from.z, to.x, to.z);
+  }
+
+  /** Un tiro a una entidad: se acepta si va con el rifle y está a tiro y a la vista; muere al llegar su hp a cero (true) y otra la sustituye. */
+  hit(p: Player, entityId: number, elevatorOpen = false) {
     const i = this.ents.findIndex((e) => e.id === entityId);
-    if (i < 0 || p.dead || p.st.held !== 'gun') return false;
+    if (i < 0 || p.dead || p.boarded || !p.cap.gun || p.st.held !== 'gun') return false;
     const e = this.ents[i];
-    if (Math.hypot(p.st.x - e.sim.x, p.st.z - e.sim.z) > SHOT_REACH) return false;
+    if (Math.hypot(p.st.x - e.sim.x, p.st.z - e.sim.z) > SHOT_REACH || !this.shotVisible(p.st, e.sim, elevatorOpen)) return false;
     if (!e.sim.hit()) return false;
     this.ents.splice(i, 1);
     if (this.noEnts) return true;
@@ -313,7 +318,7 @@ export class Match {
    */
   photo(p: Player): number | undefined {
     const now = Date.now();
-    if (p.dead || p.st.held !== 'camera' || now - (p.lastPhoto ?? 0) < 800) return undefined;
+    if (p.dead || p.boarded || !p.cap.camera || p.st.held !== 'camera' || now - (p.lastPhoto ?? 0) < 800) return undefined;
     p.lastPhoto = now;
     const s = p.st, fx = -Math.sin(s.yaw), fz = -Math.cos(s.yaw), m = this.maze;
     for (const e of this.ents) {

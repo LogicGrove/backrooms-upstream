@@ -1,3 +1,5 @@
+import { claimPickup } from '../pickup-claim';
+import { softwareRenderer, renderRatio } from './render-budget';
 import { DEV_LOCAL } from '../devGate';
 import * as THREE from 'three';
 import { GLTFLoader, type GLTF } from 'three/examples/jsm/loaders/GLTFLoader.js';
@@ -425,6 +427,10 @@ export class BackroomsGame {
 
   constructor(readonly canvas: HTMLCanvasElement, readonly opts: { low: boolean; reduced: boolean }) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+    const gl = this.renderer.getContext(), debug = gl.getExtension('WEBGL_debug_renderer_info');
+    const software = softwareRenderer(String(gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER)));
+    if (software) opts.low = true;
+    this.dust.visible = !software;
     watchCanvas(canvas);
     this.renderer.localClippingEnabled = true; // (el agua dentro del depósito de la pistola de agua, poolmap.ts tankFx)
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -464,7 +470,7 @@ export class BackroomsGame {
     this.flash.target.position.set(0, -0.3, -6);
     const resize = () => {
       // como mucho a 1080 líneas (y a la mitad en calidad baja): el grano y la cinta lo ablandan igual
-      const w = canvas.clientWidth || innerWidth, h = canvas.clientHeight || innerHeight, pr = Math.min(devicePixelRatio, 1080 / h) * (opts.low ? 0.6 : 1) * settings.resScale;
+      const w = canvas.clientWidth || innerWidth, h = canvas.clientHeight || innerHeight, pr = renderRatio(w, h, devicePixelRatio, opts.low, software, settings.resScale);
       this.renderer.setPixelRatio(pr);
       this.renderer.setSize(w, h, false);
       this.composer?.setPixelRatio(pr);
@@ -556,14 +562,20 @@ export class BackroomsGame {
     const es = (['bacteria', 'partygoer'] as Kind[]).map((k, i) => new Entity(k, w, this.assets!, w.maze.spawns[i] ?? w.maze.start));
     es.forEach((e) => e.update(0, p.pos, this.camera.position, null, true, true));
     w.root.add(Shatter.warm(es.map((e) => e.rig.root)));
-    new Items(w, this.assets, p, this.camera); // y lo que se recoge (cintas, cámara y rifle en el suelo)
+    const warmItems = new Items(w, this.assets, p, this.camera); // y lo que se recoge (cintas, cámara y rifle en el suelo)
     await compileGently(this.renderer, this.scene, this.camera, undefined, (f) => progress(0.8 + f * 0.2));
     // y las pasadas (con todo lo de antes ya compilado): con y sin VHS, que la última pinta a pantalla y es otro programa
     this.vhs.enabled = false;
     this.composer.render(0);
     this.vhs.enabled = true;
     this.composer.render(0);
-    this.stills = this.prerender(w, p, es);
+    const ratio = this.renderer.getPixelRatio();
+    const preview = Math.min(ratio, 320 / (this.canvas.clientWidth || innerWidth), 180 / (this.canvas.clientHeight || innerHeight));
+    this.renderer.setPixelRatio(preview);
+    this.composer.setPixelRatio(preview);
+    try { this.stills = this.prerender(w, p, es); }
+    finally { this.renderer.setPixelRatio(ratio); this.composer.setPixelRatio(ratio); }
+    warmItems.dispose();
     es.forEach((e) => e.dispose());
     p.dispose();
     w.dispose();
@@ -663,6 +675,7 @@ export class BackroomsGame {
 
     this.endPool();
     this.player?.dispose();
+    this.items?.dispose();
     this.world?.dispose();
     this.black = 0;
     this.winning = false;
@@ -1417,7 +1430,7 @@ export class BackroomsGame {
       const d = Math.hypot(o.position.x - wr.pos.x, o.position.z - wr.pos.z);
       if (d < bd) (bd = d), (best = id);
     }
-    if (best) mp.sock.emit('pickup', best, (ok: boolean) => (ok ? this.audio?.pickup() : wr.say('CANNOT CARRY MORE')));
+    if (best) void claimPickup(mp.sock, best, (ok: boolean) => (ok ? this.audio?.pickup() : wr.say('CANNOT CARRY MORE')));
   }
 
   /** Lo soltado en el suelo de la sala de espera: los nuevos se ponen con su modelo, los que ya no están se quitan. */
@@ -1592,7 +1605,7 @@ export class BackroomsGame {
     const beat = setInterval(() => performance.now() - this.lastFrame > 150 && !this.spectating && this.sendState(), 1000 / 15);
     this.offNet.push(() => clearInterval(beat));
     this.offNet.push(() => (s.off('room', onRoom), s.off('players', onPlayers), s.off('world', onWorld), s.off('dead', onDead), s.off('reviving', onReviving), s.off('revived', onRevived), s.off('runFailed', onRunFailed), removeEventListener('keydown', key)));
-    if (items) (items.claim = (id, done) => s.emit('pickup', id, done)), (items.onPhoto = () => s.emit('photo'));
+    if (items) (items.claim = (id, done) => { void claimPickup(s, id, done); }), (items.onPhoto = () => s.emit('photo'));
   }
 
   /** Los demás jugadores según lo que dice el servidor: se crean (con un clon reutilizado, en `parent`), se mueven y se quitan los que ya no están. */
@@ -2048,7 +2061,7 @@ fps ${(1 / Math.max(dt, 1e-3)).toFixed(0)}`;
     gd.net(mp.sock);
     // jabones (pickup), tanque, pistola de agua (squirt) y lo que me hacen los demás con ella (wet)
     p.tank = me.tankWorn;
-    p.claim = (id, done) => mp.sock.emit('pickup', id, (ok: boolean) => (done(ok), ok || (this.note = { text: 'CANNOT TAKE THAT (ALREADY HAVE IT OR TOO FAR)', until: performance.now() + 2000 })));
+    p.claim = (id, done) => void claimPickup(mp.sock, id, (ok: boolean) => (done(ok), ok || (this.note = { text: 'CANNOT TAKE THAT (ALREADY HAVE IT OR TOO FAR)', until: performance.now() + 2000 })));
     // lo recogido (latas w, linternas f, tanque k, pistola p) pasa a mi inventario local; los jabones no cuentan
     p.onTake = (id) => {
       const kind = id[0] === 'd' ? (this.dropKind.get(id) as ItemId | undefined) : ({ w: 'water', f: 'flashlight', c: 'camera', k: 'tank', p: 'watergun' } as const)[id[0] as 'w'];
@@ -2357,6 +2370,7 @@ x ${f(s.x)}  y ${f(s.y)}  z ${f(s.z)}  yaw ${f(s.yaw)}  pitch ${f(s.pitch)}`;
     this.audio?.dispose();
     this.audio = undefined;
     this.player?.dispose();
+    this.items?.dispose();
     this.world?.dispose();
     this.gadgets?.dispose();
     this.gadgets = undefined;
@@ -2379,6 +2393,7 @@ x ${f(s.x)}  y ${f(s.y)}  z ${f(s.z)}  yaw ${f(s.yaw)}  pitch ${f(s.pitch)}`;
 
   dispose() {
     this.renderer.setAnimationLoop(null);
+    this.endPool();
     this.endRun();
     this.stopMp();
     this.spare.forEach((r) => r.dispose());
@@ -2394,6 +2409,7 @@ x ${f(s.x)}  y ${f(s.y)}  z ${f(s.z)}  yaw ${f(s.yaw)}  pitch ${f(s.pitch)}`;
     this.gadgets?.dispose();
 
     this.player?.dispose();
+    this.items?.dispose();
     this.world?.dispose();
     this.renderer.dispose();
     this.renderer.forceContextLoss();

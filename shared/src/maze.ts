@@ -62,7 +62,11 @@ export const hasPanel = (m: Pick<Maze, 'w' | 'zone'>, x: number, y: number) => (
 
 /** Distancias por BFS desde `from` (-1 donde no se llega); `blocked` cuenta como pared. */
 export function bfs(m: Pick<Maze, 'w' | 'h' | 'open'>, from: Cell, blocked?: Set<number>) {
-  const d = new Int32Array(m.w * m.h).fill(-1), q = [from.y * m.w + from.x];
+  const d = new Int32Array(m.w * m.h).fill(-1);
+  if (!Number.isInteger(from.x) || !Number.isInteger(from.y) || from.x < 0 || from.y < 0 || from.x >= m.w || from.y >= m.h) return d;
+  const origin = from.y * m.w + from.x;
+  if (!m.open[origin] || blocked?.has(origin)) return d;
+  const q = [origin];
   d[q[0]] = 0;
   for (let i = 0; i < q.length; i++) {
     const c = q[i], x = c % m.w, y = (c / m.w) | 0;

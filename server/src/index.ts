@@ -9,7 +9,7 @@ import {
 } from '@backrooms/shared';
 import { Match, type Player } from './match';
 import { ACHIEVEMENT_KEYS, levelCaps, solidAt, startOffset } from '@backrooms/shared';
-import { allowedOrigins, handleApi, isAdminName, originOk, userFromCookie } from './auth';
+import { allowedOrigins, handleApi, isAdminAccount, originOk, userFromCookie } from './auth';
 import { MONEY_LIMIT, parseAdmin } from './admin';
 import { achievementsOf, avatarRef, loadoutOf } from './db';
 import { award, count, hooks } from './progress';
@@ -72,6 +72,8 @@ interface RoomState extends Omit<Room, 'caps' | 'offers' | 'leading' | 'mission'
   tok?: number;
   /** Objetos soltados en el suelo (con la hora a la que se soltaron, para el TTL). */
   drops: Map<string, Drop & { at: number }>;
+  /** Recogidas aceptadas en esta fase: un reintento del mismo jugador confirma el resultado sin volver a dar el objeto. */
+  pickups: Map<string, string>;
 }
 const rooms = new Map<string, RoomState>();
 const where = new Map<string, string>(); // socket → código de su sala
@@ -181,6 +183,7 @@ function backToLobby(r: RoomState, ps: Player[]) {
   r.done = false;
   r.boardAt = undefined;
   r.drops.clear();
+  r.pickups.clear();
   prepare(r);
   // de vuelta a la sala de espera: cada uno en su sitio
   ps.forEach((p, i) => ((p.dead = false), (p.boarded = false), (p.seen = false), (p.hp = HP_MAX), (p.water = 0), (p.totem = 0), (p.reviving = p.immuneUntil = undefined), (p.ready = false), (p.st = waitSpot(i)), (p.cap = { ...p.inv })));
@@ -273,6 +276,7 @@ function begin(r: RoomState) {
     if (o && canHold(o.inv, d.kind)) o.inv = addItem(o.inv, d.kind);
   }
   r.drops.clear();
+  r.pickups.clear();
   // lo que cada uno lleva a la ronda: su inventario (la tienda y lo conservado)
   for (const p of r.players.values()) (p.boarded = false), (p.cap = { ...p.inv }), io.to(p.id).emit('inv', p.inv);
   r.phase = 'starting';
@@ -357,7 +361,7 @@ io.on('connection', (sock) => {
     if (status.maintenance) return cb({ error: 'Maintenance' });
     if (rooms.size >= MAX_ROOMS) return cb({ error: 'Server full' });
     leave(sock.id);
-    const r: RoomState = { code: newCode(), tape: ++tapeNo, name: `SALA ${tapeNo}`, public: !!a?.public, ownerId: sock.id, max: MAX_PLAYERS, difficulty: a?.difficulty && a.difficulty in DIFFICULTY ? a.difficulty : 'normal', fixedSeed: 0, pools: false, phase: 'lobby', seed: 0, players: new Map(), size0: 0, deaths: 0, strips: [], bank: START_BANK, round: 1, levelId: 'level0', nextSeed: 0, pool: [], votes: new Map(), loaded: new Set(), done: false, lastProgress: -1, drops: new Map() };
+    const r: RoomState = { code: newCode(), tape: ++tapeNo, name: `SALA ${tapeNo}`, public: !!a?.public, ownerId: sock.id, max: MAX_PLAYERS, difficulty: typeof a?.difficulty === 'string' && Object.hasOwn(DIFFICULTY, a.difficulty) ? a.difficulty : 'normal', fixedSeed: 0, pools: false, phase: 'lobby', seed: 0, players: new Map(), size0: 0, deaths: 0, strips: [], bank: START_BANK, round: 1, levelId: 'level0', nextSeed: 0, pool: [], votes: new Map(), loaded: new Set(), done: false, lastProgress: -1, drops: new Map(), pickups: new Map() };
     prepare(r);
     rooms.set(r.code, r);
     join(r, cleanName(a?.name), cb);
@@ -394,7 +398,7 @@ io.on('connection', (sock) => {
     if (typeof a.name === 'string') r.name = a.name.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, ROOM_NAME_MAX) || r.name;
     if (typeof a.public === 'boolean') r.public = a.public;
     if (Number.isFinite(a.max)) r.max = Math.min(MAX_PLAYERS, Math.max(2, r.players.size, Math.round(a.max!)));
-    if (a.difficulty && a.difficulty in DIFFICULTY && a.difficulty !== r.difficulty) (r.difficulty = a.difficulty), prepare(r, r.nextSeed, r.levelId); // mismas semilla y nivel: solo cambia lo que da cada misión
+    if (typeof a.difficulty === 'string' && Object.hasOwn(DIFFICULTY, a.difficulty) && a.difficulty !== r.difficulty) (r.difficulty = a.difficulty), prepare(r, r.nextSeed, r.levelId); // mismas semilla y nivel: solo cambia lo que da cada misión
     if (typeof a.pools === 'boolean' && a.pools !== r.pools) (r.pools = a.pools), prepare(r); // otro sorteo de niveles (apagado: vuelve al nivel 0)
     if (Number.isFinite(a.fixedSeed)) {
       const f = Math.min(2 ** 31 - 1, Math.max(0, Math.floor(a.fixedSeed!)));
@@ -466,7 +470,7 @@ io.on('connection', (sock) => {
   const isAdmin = () => {
     if (!acct || !uid) return false;
     const s = userFromCookie(hs.cookie);
-    return !!s && s.user.id === uid && isAdminName(s.user.username);
+    return !!s && s.user.id === uid && isAdminAccount(s.user.id);
   };
   sock.on('admin', (raw, cb) => {
     const reply = (x: AdminReply) => typeof cb === 'function' && cb(x);
@@ -622,18 +626,23 @@ io.on('connection', (sock) => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id);
     const k = String(id);
     const kind = GAIN[k[0]];
+    if (r && p && (r.phase === 'lobby' || r.phase === 'playing') && r.pickups.get(k) === p.id) {
+      if (typeof cb === 'function') cb(true);
+      return;
+    }
     // (ids d...: soltados) Lo del mapa que no cabe (ya lo lleva, o el tope) se deja donde está: si no, se perdería para todos sin llegar a nadie
     // (en la sala de espera solo hay soltados `d…`: se recogen para el inventario que se conserva)
     if (r?.phase === 'lobby' && p && k[0] === 'd') {
       const d = r.drops.get(k);
       const got = !!d && Math.hypot(p.st.x - d.x, p.st.z - d.z) < 3.6 && canHold(p.inv, d.kind);
-      if (got) (r.drops.delete(k), (p.inv = addItem(p.inv, d!.kind)), sock.emit('inv', p.inv));
+      if (got) (r.drops.delete(k), (p.inv = addItem(p.inv, d!.kind)), r.pickups.set(k, p.id), sock.emit('inv', p.inv));
       if (typeof cb === 'function') cb(got);
       return;
     }
     const ok = !!r?.match && !!p && r.phase === 'playing' && !p.boarded && (k[0] === 'd' ? takeDrop(r, p, k) : (!kind || canHold(p.cap, kind)) && r.match.pickup(p, k));
     if (ok && p!.uid && k[0] === 't') count(p!.uid, 'tapes'); // las cintas (ids t...)
     if (ok && k[0] !== 'd') gain(p!, k); // lo que se lleva: hay que tenerlo para soltarlo, beberlo o declararlo al subir
+    if (ok) r!.pickups.set(k, p!.id);
     if (typeof cb === 'function') cb(ok);
   });
 
@@ -673,14 +682,14 @@ io.on('connection', (sock) => {
     // como mucho un tiro cada 0,2 s
     if (Date.now() - p.lastHit < 200) return;
     p.lastHit = Date.now();
-    if (r.match.hit(p, Number(id)) && p.uid) (award(p.uid, 'idiot'), count(p.uid, 'kills'));
+    if (r.match.hit(p, Number(id), r.done) && p.uid) (award(p.uid, 'idiot'), count(p.uid, 'kills'));
   });
 
   // fuego amigo: un tiro del rifle que da a un compañero lo mata (el cliente apunta; aquí se comprueba rifle en mano, distancia y ritmo)
   sock.on('shoot', (id) => {
     const r = roomOf(sock.id), p = r?.players.get(sock.id), q = r?.players.get(String(id));
-    if (!r?.match || !p || !q || q === p || r.phase !== 'playing' || p.dead || p.boarded || q.dead || q.boarded || p.st.held !== 'gun' || (q.immuneUntil ?? 0) > Date.now()) return;
-    if (Date.now() - p.lastHit < 200 || Math.hypot(p.st.x - q.st.x, p.st.z - q.st.z) > 35) return;
+    if (!r?.match || !p || !q || q === p || r.phase !== 'playing' || p.dead || p.boarded || q.dead || q.boarded || !p.cap.gun || p.st.held !== 'gun' || (q.immuneUntil ?? 0) > Date.now()) return;
+    if (Date.now() - p.lastHit < 200 || Math.hypot(p.st.x - q.st.x, p.st.z - q.st.z) > 35 || !r.match.shotVisible(p.st, q.st, r.done)) return;
     p.lastHit = Date.now();
     q.hp = 0;
     q.dead = true;

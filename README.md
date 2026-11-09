@@ -10,3 +10,7 @@ python tools/build.py --build    # production client build
 ```
 
 Documentation index: [docs/README.md](docs/README.md) (architecture, spec/protocol, glossary, contributor guide for LLMs).
+
+## Local review
+
+Based on [s7lver2/backrooms](https://github.com/s7lver2/backrooms), upstream commit3ad9198. Corrections and verification notes are in [docs/REVISION-LOCAL.md](docs/REVISION-LOCAL.md). Run `npm test` for targeted regressions. Server admin access requires an existing account ID explicitly configured with `ADMIN_UID`.

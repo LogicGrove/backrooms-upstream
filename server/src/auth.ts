@@ -1,3 +1,5 @@
+import { isAdminAccount } from './admin-access';
+export { isAdminAccount } from './admin-access';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { hash, verify } from '@node-rs/argon2';
@@ -161,13 +163,13 @@ function newSession(userId: number) {
 }
 
 /** ¿Es el nombre de la cuenta de admin? Comparación exacta (el nombre guardado es el que se escribió al registrarse). */
-export const isAdminName = (name: string) => name === ADMIN_USER;
+
 
 export function meOf(uid: number, username: string): Me {
   const achievements = db.achievementsOf(uid), have = new Set(Object.keys(achievements));
   return {
     username,
-    ...(isAdminName(username) ? { admin: true } : {}),
+    ...(isAdminAccount(uid) ? { admin: true } : {}),
     avatar: db.avatarRef(uid),
     achievements,
     stats: db.statsOf(uid),
