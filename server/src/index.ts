@@ -13,6 +13,7 @@ import { allowedOrigins, handleApi, isAdminAccount, originOk, userFromCookie } f
 import { MONEY_LIMIT, parseAdmin } from './admin';
 import { achievementsOf, avatarRef, loadoutOf } from './db';
 import { award, count, hooks } from './progress';
+import { expirePickupReceipts, type PickupReceipt } from './pickup-receipts';
 
 /*
  * El servidor de las salas: crea y lista salas, reparte los estados de los jugadores (15 Hz) y lleva la
@@ -73,7 +74,7 @@ interface RoomState extends Omit<Room, 'caps' | 'offers' | 'leading' | 'mission'
   /** Objetos soltados en el suelo (con la hora a la que se soltaron, para el TTL). */
   drops: Map<string, Drop & { at: number }>;
   /** Recogidas aceptadas en esta fase: un reintento del mismo jugador confirma el resultado sin volver a dar el objeto. */
-  pickups: Map<string, string>;
+  pickups: Map<string, PickupReceipt>;
 }
 const rooms = new Map<string, RoomState>();
 const where = new Map<string, string>(); // socket → código de su sala
@@ -623,10 +624,11 @@ io.on('connection', (sock) => {
   });
 
   sock.on('pickup', (id, cb) => {
-    const r = roomOf(sock.id), p = r?.players.get(sock.id);
+    const r = roomOf(sock.id), p = r?.players.get(sock.id), now = Date.now();
     const k = String(id);
     const kind = GAIN[k[0]];
-    if (r && p && (r.phase === 'lobby' || r.phase === 'playing') && r.pickups.get(k) === p.id) {
+    if (r) expirePickupReceipts(r.pickups, now);
+    if (r && p && (r.phase === 'lobby' || r.phase === 'playing') && r.pickups.get(k)?.by === p.id) {
       if (typeof cb === 'function') cb(true);
       return;
     }
@@ -635,14 +637,14 @@ io.on('connection', (sock) => {
     if (r?.phase === 'lobby' && p && k[0] === 'd') {
       const d = r.drops.get(k);
       const got = !!d && Math.hypot(p.st.x - d.x, p.st.z - d.z) < 3.6 && canHold(p.inv, d.kind);
-      if (got) (r.drops.delete(k), (p.inv = addItem(p.inv, d!.kind)), r.pickups.set(k, p.id), sock.emit('inv', p.inv));
+      if (got) (r.drops.delete(k), (p.inv = addItem(p.inv, d!.kind)), r.pickups.set(k, { by: p.id, at: now }), sock.emit('inv', p.inv));
       if (typeof cb === 'function') cb(got);
       return;
     }
     const ok = !!r?.match && !!p && r.phase === 'playing' && !p.boarded && (k[0] === 'd' ? takeDrop(r, p, k) : (!kind || canHold(p.cap, kind)) && r.match.pickup(p, k));
     if (ok && p!.uid && k[0] === 't') count(p!.uid, 'tapes'); // las cintas (ids t...)
     if (ok && k[0] !== 'd') gain(p!, k); // lo que se lleva: hay que tenerlo para soltarlo, beberlo o declararlo al subir
-    if (ok) r!.pickups.set(k, p!.id);
+    if (ok) r!.pickups.set(k, { by: p!.id, at: now });
     if (typeof cb === 'function') cb(ok);
   });
 

@@ -6,6 +6,21 @@ import { test } from 'node:test';
 import { io } from 'socket.io-client';
 import { CELL, DEFAULT_LOOK, START_INV, centerOf, itemSpots, solidAt, type EntitySim, type Maze } from '@backrooms/shared';
 import { Match, type Player } from '../server/src/match';
+import { expirePickupReceipts } from '../server/src/pickup-receipts';
+
+test('pickup receipts expire after 30 seconds and preserve recent retries', () => {
+  const now = 100_000;
+  const receipts = new Map([
+    ['old', { by: 'player', at: now - 30_001 }],
+    ['boundary', { by: 'player', at: now - 30_000 }],
+    ['recent', { by: 'player', at: now - 7_500 }],
+  ]);
+  expirePickupReceipts(receipts, now);
+  assert.deepEqual([...receipts.keys()], ['recent']);
+  assert.equal(receipts.get('recent')?.at, now - 7_500);
+  expirePickupReceipts(receipts, now + 30_000);
+  assert.equal(receipts.size, 0);
+});
 
 function player(match: Match): Player {
   return {
